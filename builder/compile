@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+
+base_dir="/usr"
+CLASSPATH=""
+for library in "confluent-security/schema-registry" "schema-registry-plugins" "confluent-common" "confluent-telemetry" "rest-utils" "schema-registry"; do
+  CLASSPATH=$CLASSPATH:$base_dir/share/java/$library/*
+done
+
+echo "Nuking incompatible libraries"
+echo "Nuking Azure for being to agressive statically loading"
+find "${base_dir}/share/java" -name "azure*.jar" -delete
+
+
+echo "Nuking non-linux jars"
+find "${base_dir}/share/java" -name "*Final-osx-*.jar" -delete
+find "${base_dir}/share/java" -name "*Final-windows-*.jar" -delete
+
+echo "Debugging community configuration files"
+ls -lha /community-reachability-metadata/META-INF/native-image/*.json
+echo "Debugging generated configuration files"
+ls -lha /instrumented-reachability-metadata/META-INF/native-image/*.json
+
+
+
+echo "Compiling with classpath ${CLASSPATH}"
+native-image \
+    --verbose \
+    -cp "/community-reachability-metadata" \
+    -cp "/instrumented-reachability-metadata" \
+    -cp "${CLASSPATH}" \
+    --enable-sbom \
+    --enable-http \
+    --enable-https \
+    --trace-object-instantiation=org.apache.logging.slf4j.Log4jLogger \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.channel.nio.AbstractNioByteChannel \
+    --initialize-at-run-time=io.netty.channel.epoll \
+    --initialize-at-run-time=io.netty.channel.kqueue \
+    --initialize-at-run-time=io.netty.handler.codec.http.websocketx.WebSocketServerHandshaker \
+    --initialize-at-build-time=com.fasterxml.jackson.databind.ObjectWriter$GeneratorSettings \
+    --trace-object-instantiation=com.fasterxml.jackson.databind.ObjectWriter$Prefetch \
+    --initialize-at-run-time=io.netty.handler.codec.CodecOutputList \
+    --initialize-at-run-time=io.netty.handler.ssl.util.ThreadLocalInsecureRandom,io.netty.channel.unix,io.netty.channel.epoll,io.netty.channel.kqueue \
+    --initialize-at-run-time=io.netty.util.internal.logging.InternalLoggerFactory \
+    --trace-object-instantiation=io.netty.util.internal.logging.Slf4JLoggerFactory \
+    --initialize-at-run-time=io.netty.buffer.AbstractByteBuf \
+    --initialize-at-run-time=io.netty.channel \
+    --initialize-at-run-time=io.netty.util.internal \
+    --initialize-at-run-time=io.netty.buffer \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.channel.epoll \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.channel.kqueue \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.handler.codec.http.websocketx.WebSocketServerHandshaker \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.handler.codec.CodecOutputList \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.handler.ssl.util.ThreadLocalInsecureRandom,io.grpc.netty.shaded.io.netty.channel.unix,io.grpc.netty.shaded.io.netty.channel.epoll,io.grpc.netty.shaded.io.netty.channel.kqueue \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.util.internal.logging.InternalLoggerFactory \
+    --trace-object-instantiation=io.grpc.netty.shaded.io.netty.util.internal.logging.Slf4JLoggerFactory \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.buffer.AbstractByteBuf \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.channel \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.util.internal \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.buffer \
+    --trace-object-instantiation=io.grpc.netty.shaded.io.netty.util.internal.logging.LocationAwareSlf4JLogger \
+    --initialize-at-build-time=io.grpc.netty.shaded.io.netty.util.internal.logging.LocationAwareSlf4JLogger \
+    --trace-object-instantiation=org.apache.logging.slf4j.Log4jLogger \
+    --initialize-at-run-time=org.apache.logging.log4j.core.Logger \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.util.NetUtil \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.util.NetUtilInitializations \
+    --initialize-at-run-time=io.grpc.netty.shaded.io.netty.util.ResourceLeakDetectorFactory \
+    io.confluent.kafka.schemaregistry.rest.SchemaRegistryMain schema-registry #/etc/schema-registry/schema-registry.properties
+# --initialize-at-build-time=org.joda.time \ # is this good? Will it leave references to "now" embedded in the image?
+# --initialize-at-build-time=org.apache.logging.log4j \
+#    --exact-reachability-metadata \ causes com.oracle.svm.core.util.VMError$HostedError: Bulk queries can only be set with 'name' which does not allow run-time conditions.
+#    See https://github.com/oracle/graal/issues/13316
+    # --initialize-at-run-time=io.netty.util.AsciiString \
+    # --initialize-at-build-time=org.slf4j.helpers.SubstituteLoggerFactory \
+    # --initialize-at-build-time=org.slf4j.helpers.NOPLoggerFactory \
+    # --initialize-at-build-time=org.apache.logging.slf4j \
+    # --initialize-at-build-time=org.apache.logging.slf4j.Log4jLogger \
+    # --initialize-at-build-time=org.apache.logging.slf4j.Log4jLoggerFactory \
+    # --initialize-at-build-time=org.apache.logging.slf4j.Log4jMarkerFactory \
+    # --initialize-at-build-time=org.apache.logging.log4j \
+    # --initialize-at-build-time=org.apache.logging.log4j.status \
+    # --initialize-at-build-time=org.apache.logging.log4j.core \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.Logger \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.LoggerContext \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.appender.ConsoleAppender \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.config.yaml.YamlConfiguration \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.layout \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.pattern \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.impl \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.impl.Log4jProvider \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.impl.Log4jContext \
+    # --initialize-at-build-time="org.apache.logging.log4j.core.impl.ThreadContextDataInjector\$ForDefaultThreadContextMap" \
+    # --initialize-at-build-time="org.apache.logging.log4j.core.Logger\$PrivateConfig" \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.util \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.config.LoggerConfig \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.config \
+    # --initialize-at-build-time=org.apache.logging.log4j.core.selector \
+    # --initialize-at-build-time=org.apache.logging.log4j.Level \
+    # --initialize-at-build-time=org.apache.logging.log4j.message \
+    # --initialize-at-build-time=org.apache.logging.log4j.util \
+    # --initialize-at-build-time=org.apache.logging.log4j.spi \
+    # --initialize-at-build-time=io.confluent.opentelemetry \
+    # --initialize-at-build-time=io.confluent.opentelemetry.SpanContextDataInjector \
+    # --initialize-at-build-time=org.apache.log4j.xml.XmlConfigurationFactory \
+    # --initialize-at-build-time=org.apache.log4j.config.PropertiesConfigurationFactory \
+    # --initialize-at-run-time=java.util.zip.Inflater \
+    # --initialize-at-run-time=sun.net.www.protocol.jar.JarURLConnection \
+    # --trace-object-instantiation=java.util.zip.Inflater \
+    # --trace-object-instantiation=sun.net.www.protocol.jar.JarURLConnection \
+    # --initialize-at-build-time="com.fasterxml.jackson.core.Base64Variant\$PaddingReadBehaviour" \
+    # --initialize-at-build-time=com.fasterxml.jackson.core \
+    # --initialize-at-build-time=com.fasterxml.jackson.core.Base64Variant \
+    # --initialize-at-build-time=com.fasterxml.jackson.core.JsonFactory \
+    # --initialize-at-build-time=com.fasterxml.jackson.databind.ObjectWriter \
+    # --initialize-at-build-time="com.fasterxml.jackson.databind.ObjectWriter$GeneratorSettings" \
+    # --initialize-at-build-time="com.fasterxml.jackson.databind.ObjectWriter$Prefetch" \
+    # --initialize-at-build-time=com.fasterxml.jackson.databind.node.ObjectNode \
+    # --initialize-at-build-time=com.fasterxml.jackson.databind.node.JsonNodeFactory \
+    # --initialize-at-build-time=com.fasterxml.jackson.databind.node \
+    # --initialize-at-run-time=io.netty.channel.epoll \
+    # --initialize-at-run-time=io.netty.channel.kqueue \
+    # --initialize-at-run-time=io.netty.handler.codec.http.websocketx.WebSocketServerHandshaker \
+    # --initialize-at-build-time=com.fasterxml.jackson.databind.ObjectWriter$GeneratorSettings \
+    # --trace-object-instantiation=com.fasterxml.jackson.databind.ObjectWriter$Prefetch \
+    # --initialize-at-run-time=io.netty.handler.codec.CodecOutputList \
+    # --initialize-at-run-time=io.netty.handler.ssl.util.ThreadLocalInsecureRandom,io.netty.channel.unix,io.netty.channel.epoll,io.netty.channel.kqueue \
+    # --initialize-at-run-time=io.netty.util.internal.logging.InternalLoggerFactory \
+    # --trace-object-instantiation=io.netty.util.internal.logging.Slf4JLoggerFactory \
+    # --initialize-at-run-time=io.netty.buffer.AbstractByteBuf \
+    # --initialize-at-run-time=io.netty.channel \
+    # --initialize-at-run-time=io.netty.util.internal \
+    # --initialize-at-run-time=io.netty.buffer \
+    # --initialize-at-build-time=io.netty.util.internal.logging.LocationAwareSlf4JLogger \
+    # --initialize-at-build-time=com.fasterxml.jackson.databind.json.JsonMapper \
+    # --initialize-at-build-time=com.fasterxml.jackson \
+    # --initialize-at-build-time=org.joda.time \
+    # --initialize-at-run-time=io.netty.util.AttributeKey \
+    # --initialize-at-run-time=io.netty.handler.codec.string.LineSeparator \
+    # --initialize-at-run-time=io.netty.handler.codec.http.HttpResponseStatus \
+    # --initialize-at-run-time=io.netty.util.ReferenceCountUtil \
+    # --initialize-at-run-time=io.netty.util.internal.PlatformDependent \
+    # --initialize-at-run-time=io.netty.handler.codec.http.websocketx.WebSocketClientHandshaker \
+    # --initialize-at-run-time=io.netty.handler \
+    # --initialize-at-run-time=io.netty.util.concurrent.AbstractEventExecutor \
+    # --initialize-at-build-time=scala.collection.mutable.ListBuffer \

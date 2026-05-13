@@ -1,0 +1,18 @@
+FROM docker.io/confluentinc/cp-schema-registry:latest-ubi9 AS schema-registry
+FROM  docker.io/redhat/ubi9-minimal:latest
+#micro doesn't have the tools ootb to add users etc.
+
+RUN useradd -u 1000 -g 0 appuser
+COPY --from=schema-registry /usr/bin/ub /usr/bin/ub
+COPY --from=schema-registry /etc/confluent /etc/confluent
+
+
+COPY --chown=appuser ./kafka-schema-registry-package /home/appuser/kafka-schema-registry-package
+COPY ./schema-registry-start /usr/bin/schema-registry-start
+
+ENTRYPOINT [ "/etc/confluent/docker/run" ]
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    container=oci \
+    LANG=C.UTF-8 \
+    USE_LOG4J_2=True \
+    COMPONENT=schema-registry
