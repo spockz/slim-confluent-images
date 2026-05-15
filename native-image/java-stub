@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# This is a stub for the java runtime used specifically when calling the kafka-ready function.
+# It is intended as the most minimal stub until such time the whole binary can be / is natively compiled.
+#
+check_port_connectivity() {
+    local hostname="$1"
+    local port="$2"
+    local timeout=3
+
+    # Check if both hostname and port are provided
+    if [ -z "$hostname" ] || [ -z "$port" ]; then
+        echo "Usage: check_port_connectivity <hostname> <port>"
+        return 1
+    fi
+
+    # Use the /dev/tcp file descriptor redirection
+    if timeout $timeout bash -c "</dev/tcp/${hostname}/${port}" 2>/dev/null; then
+        echo "SUCCESS: Host '$hostname' is reachable on port $port."
+        return 0
+    else
+        echo "FAILURE: Host '$hostname' is NOT reachable on port $port (or port is closed)."
+        return 1
+    fi
+}
+
+check_for_substring() {
+    local substring="$1"
+    local found_arg=""
+
+    if [ -z "$substring" ]; then
+        echo "Error: Please provide the substring you want to search for."
+        return 1
+    fi
+
+    # Iterate over all arguments passed to the script/function
+    for arg in "$@"; do
+        # Bash's [[ $arg =~ $substring ]] uses regex matching.
+        # This is the most robust way to check for substring presence.
+        if [[ "$arg" =~ $substring ]]; then
+            found_arg="$arg"
+            echo "SUCCESS: The substring \"$substring\" was found in argument: \"$found_arg\""
+            return 0 # Exit immediately upon finding the first match
+        fi
+    done
+
+    # If the loop finishes without finding a match
+    echo "FAILURE: The substring \"$substring\" was not found in any of the provided arguments."
+    return 1
+}
+
+
+
+if check_for_substring "io.confluent.admin.utils.cli.KafkaReadyCommand" "$@"; then
+    local timeout = $1
+    local bootstrapHostnames = ""
+
+    while getopts ":b:d:e:" opt; do
+        case $opt in
+            b)
+                # Option -b: Required
+                bootstrapServers="$OPTARG"
+                echo "  [Parsed] Target String (-b): $bootstrapServers"
+                ;;
+            :) # Handles required arguments missing (e.g., running just -b)
+                echo "Error: Option -$OPTARG requires an argument." >&2
+                echo "Usage: $0 [-b <bootstrapServers>]" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    IFS=',' read -r -a nodesArray <<< "$bootstrap_string"
+
+    echo "--- Starting bootstrap process ---"
+
+    # 3. Loop through each item in the resulting array
+    for node in "${nodesArray[@]}"; do
+
+        # --- Start Critical Section: Temporary IFS change ---
+        # Save the current IFS state for this loop iteration
+        local TEMP_IFS=$IFS
+
+        # Set IFS to colon ONLY for the read operation.
+        IFS=':'
+        # Read the entry into host and port variables
+        read -r host port <<< "$node"
+
+        # Restore the IFS to the state it was before this iteration
+        IFS="$TEMP_IFS"
+        # --- End Critical Section ---
+
+        # 4. Call the required function
+        check_port_connectivity "$host" "$port" $((timeout / 1000))
+    done
+fi
