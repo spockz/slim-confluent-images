@@ -8,4 +8,5 @@ RUN curl -s "https://get.sdkman.io" | bash
 RUN source "/home/appuser/.sdkman/bin/sdkman-init.sh" \
     && sdk install java 25.0.3-graal
 
-ENV JAVA_HOME=/home/appuser/.sdkman/candidates/java/25.0.3-graal
+ENV JAVA_HOME=/home/appuser/.sdkman/candidates/java/25.0.3-graal \
+    SCHEMA_REGISTRY_OPTS="-agentlib:native-image-agent=config-merge-dir=/instrumented-reachability-metadata"
