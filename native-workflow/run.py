@@ -14,6 +14,7 @@ import re
 import shlex
 import socket
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -124,8 +125,9 @@ def copy_native_binary(engine: str, image: str, image_id: str | None, run_dir: P
     return destination
 
 
-def check_runtime_version(base: str, label: str, release_version: str, commit: str) -> None:
-    metadata = http_json("GET", base, "/v1/metadata/version")
+def check_runtime_version(base: str, label: str, release_version: str, commit: str,
+                         ssl_context: ssl.SSLContext | None = None) -> None:
+    metadata = http_json("GET", base, "/v1/metadata/version", ssl_context=ssl_context)
     if metadata.get("version") != release_version or metadata.get("commitId") != commit:
         raise WorkflowError(
             f"{label} reports build metadata {metadata}; expected version={release_version}, commitId={commit}"
@@ -241,6 +243,8 @@ def normalize_source_versions(source: Path, release_version: str) -> None:
                 element.text = release_version
                 changed = True
         if changed:
+            # Maven's model reader requires unprefixed element names.
+            ET.register_namespace("", NS[1:-1])
             tree.write(pom, encoding="UTF-8", xml_declaration=True)
 
 
@@ -261,8 +265,32 @@ def native_args_from_pom(pom: Path) -> list[str]:
     return result
 
 
+def merge_legacy_services(source: Path, release_version: str) -> bool:
+    if release_version != "8.2.0":
+        return False
+    path = source / "package-schema-registry" / "src" / "assembly" / "standalone.xml"
+    tree = ET.parse(path)
+    root = tree.getroot()
+    namespace = root.tag.split("}", 1)[0] + "}"
+    handlers = root.find(f"{namespace}containerDescriptorHandlers")
+    if handlers is None:
+        handlers = ET.Element(f"{namespace}containerDescriptorHandlers")
+        file_sets = root.find(f"{namespace}fileSets")
+        if file_sets is None:
+            raise WorkflowError(f"Legacy standalone assembly has no fileSets: {path}")
+        root.insert(list(root).index(file_sets), handlers)
+    if any(handler.findtext(f"{namespace}handlerName") == "metaInf-services" for handler in handlers):
+        return False
+    handler = ET.SubElement(handlers, f"{namespace}containerDescriptorHandler")
+    ET.SubElement(handler, f"{namespace}handlerName").text = "metaInf-services"
+    ET.register_namespace("", namespace[1:-1])
+    tree.write(path, encoding="UTF-8", xml_declaration=True)
+    return True
+
+
 def compose_file(run_dir: Path, project: str, platform: str, kafka_image: str,
-                 agent_port: int, native_port: int) -> Path:
+                 agent_port: int, native_port: int, agent_tls_port: int,
+                 native_tls_port: int) -> Path:
     document = {
         "services": {
             "broker": {
@@ -291,7 +319,7 @@ def compose_file(run_dir: Path, project: str, platform: str, kafka_image: str,
                 "build": {"context": "./agent", "dockerfile": "Dockerfile"},
                 "platform": platform,
                 "depends_on": ["broker"],
-                "ports": [f"127.0.0.1:{agent_port}:8081"],
+                "ports": [f"127.0.0.1:{agent_port}:8081", f"127.0.0.1:{agent_tls_port}:8082"],
                 "volumes": ["./metadata:/opt/reachability"],
                 "stop_grace_period": "45s",
             },
@@ -300,7 +328,7 @@ def compose_file(run_dir: Path, project: str, platform: str, kafka_image: str,
                 "build": {"context": "./native", "dockerfile": "Dockerfile"},
                 "platform": platform,
                 "depends_on": ["broker"],
-                "ports": [f"127.0.0.1:{native_port}:8081"],
+                "ports": [f"127.0.0.1:{native_port}:8081", f"127.0.0.1:{native_tls_port}:8082"],
                 "stop_grace_period": "45s",
             },
         }
@@ -308,6 +336,37 @@ def compose_file(run_dir: Path, project: str, platform: str, kafka_image: str,
     path = run_dir / "compose.yaml"
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def generate_tls_material(engine: str, graal_image: str, run_dir: Path) -> None:
+    tls_dir = run_dir / "tls"
+    tls_dir.mkdir()
+    keystore = tls_dir / "server.p12"
+    certificate = tls_dir / "server.pem"
+    truststore = tls_dir / "truststore.p12"
+    password = "native-workflow-test"
+    mount = f"{tls_dir}:/tls"
+    run([
+        engine, "run", "--rm", "-v", mount, "--entrypoint", "keytool", graal_image,
+        "-genkeypair", "-alias", "schema-registry", "-keyalg", "RSA", "-keysize", "2048",
+        "-validity", "2", "-dname", "CN=localhost", "-ext", "SAN=dns:localhost",
+        "-storetype", "PKCS12", "-keystore", "/tls/server.p12", "-storepass", password,
+        "-keypass", password, "-noprompt",
+    ])
+    run([
+        engine, "run", "--rm", "-v", mount, "--entrypoint", "keytool", graal_image,
+        "-exportcert", "-rfc", "-alias", "schema-registry", "-keystore", "/tls/server.p12",
+        "-storepass", password, "-file", "/tls/server.pem",
+    ])
+    run([
+        engine, "run", "--rm", "-v", mount, "--entrypoint", "keytool", graal_image,
+        "-importcert", "-noprompt", "-alias", "schema-registry", "-file", "/tls/server.pem",
+        "-storetype", "PKCS12", "-keystore", "/tls/truststore.p12", "-storepass", password,
+    ])
+    for path in (keystore, certificate, truststore):
+        if not path.is_file() or path.stat().st_size == 0:
+            raise WorkflowError(f"keytool did not create TLS material: {path}")
+        path.chmod(0o644)
 
 
 def write_context(run_dir: Path, jar: Path, native_args: list[str], graal_image: str,
@@ -318,9 +377,18 @@ def write_context(run_dir: Path, jar: Path, native_args: list[str], graal_image:
         path.mkdir(parents=True, exist_ok=True)
     for context in (agent, native):
         shutil.copy2(jar, context / "schema-registry.jar")
+        shutil.copy2(run_dir / "tls" / "server.p12", context / "server.p12")
+        shutil.copy2(run_dir / "tls" / "truststore.p12", context / "truststore.p12")
+        registry_host = "schema-registry-agent" if context == agent else "schema-registry-native"
         (context / "schema-registry.properties").write_text(
-            "listeners=http://0.0.0.0:8081\n"
-            "host.name=schema-registry\n"
+            "listeners=http://0.0.0.0:8081,https://0.0.0.0:8082\n"
+            f"host.name={registry_host}\n"
+            "ssl.keystore.location=/opt/app/server.p12\n"
+            "ssl.keystore.type=PKCS12\n"
+            "ssl.keystore.password=native-workflow-test\n"
+            "ssl.key.password=native-workflow-test\n"
+            "ssl.protocol=TLS\n"
+            "ssl.enabled.protocols=TLSv1.2,TLSv1.3\n"
             "kafkastore.bootstrap.servers=PLAINTEXT://broker:29092\n"
             "kafkastore.topic=_schemas\n"
             "kafkastore.topic.replication.factor=1\n"
@@ -333,7 +401,8 @@ def write_context(run_dir: Path, jar: Path, native_args: list[str], graal_image:
         "WORKDIR /opt/app\n"
         "COPY schema-registry.jar /opt/app/schema-registry.jar\n"
         "COPY schema-registry.properties /opt/app/schema-registry.properties\n"
-        'ENTRYPOINT ["java", "-agentlib:native-image-agent=config-output-dir=/opt/reachability", "-jar", "/opt/app/schema-registry.jar", "/opt/app/schema-registry.properties"]\n',
+        "COPY server.p12 truststore.p12 /opt/app/\n"
+        'ENTRYPOINT ["java", "-Djavax.net.debug=ssl,handshake", "-Djavax.net.ssl.trustStore=/opt/app/truststore.p12", "-Djavax.net.ssl.trustStoreType=PKCS12", "-Djavax.net.ssl.trustStorePassword=native-workflow-test", "-agentlib:native-image-agent=config-output-dir=/opt/reachability", "-jar", "/opt/app/schema-registry.jar", "/opt/app/schema-registry.properties"]\n',
         encoding="utf-8",
     )
     options = ["--no-fallback", "-H:ConfigurationFileDirectories=/opt/reachability", *native_args]
@@ -343,18 +412,22 @@ def write_context(run_dir: Path, jar: Path, native_args: list[str], graal_image:
         "WORKDIR /opt/app\n"
         "COPY schema-registry.jar /opt/app/schema-registry.jar\n"
         "COPY schema-registry.properties /opt/app/schema-registry.properties\n"
+        "COPY server.p12 truststore.p12 /opt/app/\n"
         "COPY reachability /opt/reachability\n"
         f"RUN native-image {command} -jar /opt/app/schema-registry.jar /opt/app/schema-registry\n"
         f"FROM {runtime_image}\n"
         "COPY --from=compiler /opt/app/schema-registry /usr/local/bin/schema-registry\n"
         "COPY schema-registry.properties /etc/schema-registry.properties\n"
+        "COPY --from=compiler /opt/app/server.p12 /opt/app/server.p12\n"
+        "COPY --from=compiler /opt/app/truststore.p12 /opt/app/truststore.p12\n"
         "USER 10001\n"
-        'ENTRYPOINT ["/usr/local/bin/schema-registry", "/etc/schema-registry.properties"]\n',
+        'ENTRYPOINT ["/usr/local/bin/schema-registry", "-Djavax.net.debug=ssl,handshake", "-Djavax.net.ssl.trustStore=/opt/app/truststore.p12", "-Djavax.net.ssl.trustStoreType=PKCS12", "-Djavax.net.ssl.trustStorePassword=native-workflow-test", "/etc/schema-registry.properties"]\n',
         encoding="utf-8",
     )
 
 
-def http_json(method: str, base: str, path: str, payload: dict | None = None) -> dict | list:
+def http_json(method: str, base: str, path: str, payload: dict | None = None,
+              ssl_context: ssl.SSLContext | None = None) -> dict | list:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(
         base + path,
@@ -363,11 +436,117 @@ def http_json(method: str, base: str, path: str, payload: dict | None = None) ->
         headers={"Content-Type": "application/vnd.schemaregistry.v1+json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=12) as response:
+        with urllib.request.urlopen(request, timeout=12, context=ssl_context) as response:
             return json.loads(response.read())
     except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException, OSError) as error:
         body = error.read().decode("utf-8", errors="replace") if isinstance(error, urllib.error.HTTPError) else str(error)
         raise WorkflowError(f"Schema Registry request {method} {path} failed: {body}") from error
+
+
+def verified_tls_context(certificate: Path, version: ssl.TLSVersion | None = None) -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=str(certificate))
+    context.set_alpn_protocols(["http/1.1"])
+    if version is not None:
+        context.minimum_version = version
+        context.maximum_version = version
+    return context
+
+
+def tls_protocol_probe(port: int, version: ssl.TLSVersion, label: str,
+                       release_version: str, commit: str, certificate: Path) -> dict:
+    context = verified_tls_context(certificate, version)
+    connection = http.client.HTTPSConnection("localhost", port, context=context, timeout=12)
+    try:
+        connection.connect()
+        sock = connection.sock
+        if sock is None:
+            raise WorkflowError(f"{label} did not retain its TLS socket after connecting")
+        negotiated = sock.version()
+        alpn_protocol = sock.selected_alpn_protocol()
+        cipher = sock.cipher()
+        peer = sock.getpeercert()
+        certificate_sha256 = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+        if negotiated != version.name.replace("TLSv1_", "TLSv1."):
+            raise WorkflowError(f"{label} negotiated {negotiated}, expected {version.name}")
+        if not cipher:
+            raise WorkflowError(f"{label} did not report a negotiated cipher")
+        if alpn_protocol != "http/1.1":
+            raise WorkflowError(f"{label} negotiated ALPN {alpn_protocol!r}, expected http/1.1")
+        connection.request("GET", "/v1/metadata/version")
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        if response.status != 200:
+            raise WorkflowError(f"{label} returned HTTP {response.status} during TLS probe: {body}")
+        if body.get("version") != release_version or body.get("commitId") != commit:
+            raise WorkflowError(f"{label} returned unexpected metadata during TLS probe: {body}")
+        return {
+            "label": label,
+            "requestedProtocol": version.name,
+            "negotiatedProtocol": negotiated,
+            "alpnProtocol": alpn_protocol,
+            "cipher": cipher[0],
+            "certificateSha256": certificate_sha256,
+            "peerCertificate": peer,
+            "metadata": body,
+            "result": "passed",
+        }
+    except (OSError, ssl.SSLError, http.client.HTTPException, json.JSONDecodeError) as error:
+        raise WorkflowError(f"{label} TLS {version.name} probe failed: {error}") from error
+    finally:
+        connection.close()
+
+
+def certificate_verification_error(error: BaseException) -> ssl.SSLCertVerificationError | None:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return current
+        for nested in (getattr(current, "reason", None), current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return None
+
+
+def expect_certificate_rejection(host: str, port: int, context: ssl.SSLContext,
+                                 label: str) -> dict:
+    connection = http.client.HTTPSConnection(host, port, context=context, timeout=12)
+    try:
+        connection.request("GET", "/v1/metadata/version")
+        response = connection.getresponse()
+        response.read()
+    except (OSError, ssl.SSLError, http.client.HTTPException, urllib.error.URLError) as error:
+        verification_error = certificate_verification_error(error)
+        if verification_error is None:
+            raise WorkflowError(f"{label} failed without a certificate verification error: {error}") from error
+        return {
+            "check": label,
+            "result": "passed",
+            "verificationCode": verification_error.verify_code,
+            "verificationMessage": verification_error.verify_message,
+        }
+    finally:
+        connection.close()
+    raise WorkflowError(f"{label} unexpectedly accepted the server certificate")
+
+
+def check_tls(port: int, label: str, release_version: str, commit: str,
+              certificate: Path) -> list[dict]:
+    results = [
+        tls_protocol_probe(port, version, label, release_version, commit, certificate)
+        for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3)
+    ]
+    results.append(expect_certificate_rejection(
+        "localhost", port, ssl.create_default_context(), f"{label} rejects untrusted CA",
+    ))
+    results.append(expect_certificate_rejection(
+        "127.0.0.1", port, verified_tls_context(certificate), f"{label} rejects wrong hostname",
+    ))
+    return results
 
 
 SCHEMAS = {
@@ -390,15 +569,16 @@ SCHEMAS = {
 
 
 def read_version(base: str, subject: str, schema_type: str, version: int,
-                 expected_schema: str | None = None) -> dict:
-    subject_record = http_json("GET", base, f"/subjects/{subject}/versions/{version}")
+                 expected_schema: str | None = None,
+                 ssl_context: ssl.SSLContext | None = None) -> dict:
+    subject_record = http_json("GET", base, f"/subjects/{subject}/versions/{version}", ssl_context=ssl_context)
     if (subject_record.get("version") != version or subject_record.get("subject") != subject
             or subject_record.get("schemaType", "AVRO") != schema_type):
         raise WorkflowError(f"Unexpected subject version record: {subject_record}")
     schema_id = subject_record.get("id")
     if not isinstance(schema_id, int):
         raise WorkflowError(f"Subject version has no integer schema ID: {subject_record}")
-    by_id = http_json("GET", base, f"/schemas/ids/{schema_id}")
+    by_id = http_json("GET", base, f"/schemas/ids/{schema_id}", ssl_context=ssl_context)
     if by_id.get("schemaType", "AVRO") != schema_type:
         raise WorkflowError(f"Schema type mismatch for {subject}: {by_id}")
     if by_id.get("schema") != subject_record.get("schema"):
@@ -425,70 +605,75 @@ def read_version(base: str, subject: str, schema_type: str, version: int,
     }
 
 
-def check_versions(base: str, label: str, subjects: dict[str, dict]) -> None:
-    actual_types = http_json("GET", base, "/schemas/types")
+def check_versions(base: str, label: str, subjects: dict[str, dict],
+                   ssl_context: ssl.SSLContext | None = None) -> None:
+    actual_types = http_json("GET", base, "/schemas/types", ssl_context=ssl_context)
     if not set(item.upper() for item in actual_types) >= {"AVRO", "JSON", "PROTOBUF"}:
         raise WorkflowError(f"Registry does not advertise all schema types: {actual_types}")
     for subject, details in subjects.items():
         schema_type = details["schemaType"]
         expected_versions = details["versions"]
         for version, expected in expected_versions.items():
-            actual = read_version(base, subject, schema_type, version)
+            actual = read_version(base, subject, schema_type, version, ssl_context=ssl_context)
             if actual != expected:
                 raise WorkflowError(f"{label} changed subject {subject} version {version}: {actual} != {expected}")
-        latest = http_json("GET", base, f"/subjects/{subject}/versions/latest")
+        latest = http_json("GET", base, f"/subjects/{subject}/versions/latest", ssl_context=ssl_context)
         if latest.get("version") != max(expected_versions):
             raise WorkflowError(f"Latest version mismatch for {subject}: {latest}")
-    check_incompatible_avro(base, label, subjects)
+    check_incompatible_avro(base, label, subjects, ssl_context)
     print(f"Functional schema checks passed against {label}", flush=True)
 
 
-def check_incompatible_avro(base: str, label: str, subjects: dict[str, dict]) -> None:
+def check_incompatible_avro(base: str, label: str, subjects: dict[str, dict],
+                            ssl_context: ssl.SSLContext | None = None) -> None:
     subject = "native-workflow-avro-value"
-    before = http_json("GET", base, f"/subjects/{subject}/versions/latest")
+    before = http_json("GET", base, f"/subjects/{subject}/versions/latest", ssl_context=ssl_context)
     incompatible = {
         "schemaType": "AVRO",
         "schema": '{"type":"record","name":"WorkflowRecord","fields":[{"name":"name","type":"int"}]}',
     }
     result = http_json(
         "POST", base, f"/compatibility/subjects/{subject}/versions/latest", incompatible,
+        ssl_context=ssl_context,
     )
     if result.get("is_compatible") is not False:
         raise WorkflowError(f"{label} accepted an incompatible Avro change: {result}")
-    after = http_json("GET", base, f"/subjects/{subject}/versions/latest")
+    after = http_json("GET", base, f"/subjects/{subject}/versions/latest", ssl_context=ssl_context)
     if after != before or before.get("version") != max(subjects[subject]["versions"]):
         raise WorkflowError(f"Compatibility check changed the stored Avro subject: {before} -> {after}")
 
 
-def register_jvm_schemas(base: str) -> dict[str, dict]:
+def register_jvm_schemas(base: str, ssl_context: ssl.SSLContext | None = None) -> dict[str, dict]:
     subjects: dict[str, dict] = {}
     for kind, (schema_type, v1, v2) in SCHEMAS.items():
         subject = f"native-workflow-{kind}-value"
-        first = http_json("POST", base, f"/subjects/{subject}/versions", {"schemaType": schema_type, "schema": v1})
+        first = http_json("POST", base, f"/subjects/{subject}/versions", {"schemaType": schema_type, "schema": v1}, ssl_context)
         if not isinstance(first.get("id"), int):
             raise WorkflowError(f"Registration did not return an ID for {subject}: {first}")
         compatible = http_json(
             "POST", base, f"/compatibility/subjects/{subject}/versions/latest",
             {"schemaType": schema_type, "schema": v2},
+            ssl_context,
         )
         if compatible.get("is_compatible") is not True:
             raise WorkflowError(f"Compatible {schema_type} evolution was rejected for {subject}: {compatible}")
-        second = http_json("POST", base, f"/subjects/{subject}/versions", {"schemaType": schema_type, "schema": v2})
+        second = http_json("POST", base, f"/subjects/{subject}/versions", {"schemaType": schema_type, "schema": v2}, ssl_context)
         if not isinstance(second.get("id"), int):
             raise WorkflowError(f"Second registration did not return an ID for {subject}: {second}")
-        v1_record = read_version(base, subject, schema_type, 1, v1)
-        v2_record = read_version(base, subject, schema_type, 2, v2)
+        v1_record = read_version(base, subject, schema_type, 1, v1, ssl_context)
+        v2_record = read_version(base, subject, schema_type, 2, v2, ssl_context)
         if first["id"] != v1_record["id"] or second["id"] != v2_record["id"]:
             raise WorkflowError(f"Registration IDs do not match subject reads for {subject}")
         subjects[subject] = {
             "schemaType": schema_type,
             "versions": {1: v1_record, 2: v2_record},
         }
-    check_versions(base, "instrumented JVM", subjects)
+    check_versions(base, "instrumented JVM", subjects, ssl_context)
     return subjects
 
 
-def register_native_schemas(base: str, subjects: dict[str, dict]) -> None:
+def register_native_schemas(base: str, subjects: dict[str, dict],
+                            ssl_context: ssl.SSLContext | None = None) -> None:
     for kind, (schema_type, _v1, v2) in SCHEMAS.items():
         subject = f"native-workflow-{kind}-value"
         if kind == "avro":
@@ -502,16 +687,18 @@ def register_native_schemas(base: str, subjects: dict[str, dict]) -> None:
         compatible = http_json(
             "POST", base, f"/compatibility/subjects/{subject}/versions/latest",
             {"schemaType": schema_type, "schema": native_schema},
+            ssl_context,
         )
         if compatible.get("is_compatible") is not True:
             raise WorkflowError(f"Native {schema_type} evolution was rejected for {subject}: {compatible}")
         result = http_json(
             "POST", base, f"/subjects/{subject}/versions",
             {"schemaType": schema_type, "schema": native_schema},
+            ssl_context,
         )
         if not isinstance(result.get("id"), int):
             raise WorkflowError(f"Native write did not return an ID for {subject}: {result}")
-        v3_record = read_version(base, subject, schema_type, 3, native_schema)
+        v3_record = read_version(base, subject, schema_type, 3, native_schema, ssl_context)
         if result["id"] != v3_record["id"]:
             raise WorkflowError(f"Native registration ID does not match subject read for {subject}")
         prior_ids = {version["id"] for version in subjects[subject]["versions"].values()}
@@ -520,12 +707,12 @@ def register_native_schemas(base: str, subjects: dict[str, dict]) -> None:
         subjects[subject]["versions"][3] = v3_record
 
 
-def wait_http(base: str, timeout: int) -> None:
+def wait_http(base: str, timeout: int, ssl_context: ssl.SSLContext | None = None) -> None:
     deadline = time.monotonic() + timeout
     last: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            http_json("GET", base, "/subjects")
+            http_json("GET", base, "/subjects", ssl_context=ssl_context)
             return
         except WorkflowError as error:
             last = error
@@ -553,6 +740,7 @@ def main() -> int:
     commit = source_snapshot(repo, args.schema_ref, source)
     remove_stale_metadata(source)
     normalize_source_versions(source, args.release_version)
+    legacy_service_merge = merge_legacy_services(source, args.release_version)
     pom = source / "package-schema-registry" / "pom.xml"
     if not pom.exists():
         raise WorkflowError(f"Package POM missing from {args.schema_ref}: {pom}")
@@ -589,6 +777,13 @@ def main() -> int:
     with zipfile.ZipFile(jar) as archive:
         if args.release_version != "8.2.0" and NATIVE_PROPERTIES not in archive.namelist():
             raise WorkflowError(f"Standalone JAR is missing its native-image options: {NATIVE_PROPERTIES}")
+        alpn_service = "META-INF/services/org.eclipse.jetty.io.ssl.ALPNProcessor$Server"
+        alpn_providers = archive.read(alpn_service).decode("utf-8").splitlines() if alpn_service in archive.namelist() else []
+        if "org.eclipse.jetty.alpn.java.server.JDK9ServerALPNProcessor" not in alpn_providers:
+            raise WorkflowError(
+                "Standalone JAR is missing the JDK ALPN service provider; rebuild it with "
+                "the metaInf-services assembly handler (omit --jar for the legacy 8.2.0 build)"
+            )
     provenance = {
         "releaseVersion": args.release_version,
         "schemaRef": args.schema_ref,
@@ -598,6 +793,8 @@ def main() -> int:
         "platform": args.platform,
         "imageTags": {"graalvm": GRAAL_IMAGE, "kafka": KAFKA_IMAGE, "runtime": RUNTIME_IMAGE},
         "nativeArgsFromPackagePom": native_args,
+        "legacyServiceDescriptorMerge": legacy_service_merge and args.jar is None,
+        "tlsChecks": [],
     }
     graal_ref, graal_inspection = pin_image(args.engine, GRAAL_IMAGE, args.platform)
     kafka_ref, kafka_inspection = pin_image(args.engine, KAFKA_IMAGE, args.platform)
@@ -610,12 +807,26 @@ def main() -> int:
     (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
     project = "srnative" + re.sub(r"[^a-z0-9]", "", run_id.lower())[-18:]
     agent_port = free_port()
-    native_port = free_port()
-    while native_port == agent_port:
-        native_port = free_port()
-    compose = compose_file(run_dir, project, args.platform, kafka_ref, agent_port, native_port)
+    allocated_ports = {agent_port}
+    ports = []
+    while len(ports) < 3:
+        candidate = free_port()
+        if candidate not in allocated_ports:
+            allocated_ports.add(candidate)
+            ports.append(candidate)
+    native_port, agent_tls_port, native_tls_port = ports
+    generate_tls_material(args.engine, graal_ref, run_dir)
+    provenance["tlsCertificateSha256"] = sha256(run_dir / "tls" / "server.pem")
+    (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    compose = compose_file(
+        run_dir, project, args.platform, kafka_ref, agent_port, native_port,
+        agent_tls_port, native_tls_port,
+    )
     write_context(run_dir, jar, native_args, graal_ref, runtime_ref)
     base = f"http://127.0.0.1:{agent_port}"
+    tls_base = f"https://localhost:{agent_tls_port}"
+    tls_certificate = run_dir / "tls" / "server.pem"
+    tls_context = verified_tls_context(tls_certificate)
     engine = compose_command(args.engine)
     prefix = [*engine, "-p", project, "-f", str(compose)]
     (run_dir / "metadata").mkdir(exist_ok=True)
@@ -624,7 +835,11 @@ def main() -> int:
         run([*prefix, "up", "-d", "broker", "agent"], log=run_dir / "agent-build.log")
         wait_http(base, args.ready_timeout)
         check_runtime_version(base, "instrumented JVM", args.release_version, commit)
-        subjects = register_jvm_schemas(base)
+        provenance["tlsChecks"].extend(check_tls(
+            agent_tls_port, "instrumented JVM", args.release_version, commit, tls_certificate,
+        ))
+        (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+        subjects = register_jvm_schemas(tls_base, tls_context)
         run([*prefix, "stop", "-t", "45", "agent"])
         run([*prefix, "logs", "--no-color", "agent"], log=run_dir / "agent.log")
         metadata_files = sorted((run_dir / "metadata").glob("*.json"))
@@ -649,17 +864,30 @@ def main() -> int:
         (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         run([*prefix, "up", "-d", "native"])
         native_base = f"http://127.0.0.1:{native_port}"
+        native_tls_base = f"https://localhost:{native_tls_port}"
         wait_http(native_base, args.ready_timeout)
         check_container_image(args.engine, prefix, provenance["nativeImage"]["id"])
         check_runtime_version(native_base, "native binary", args.release_version, commit)
-        check_versions(native_base, "native replay of JVM registrations", subjects)
-        register_native_schemas(native_base, subjects)
+        provenance["tlsChecks"].extend(check_tls(
+            native_tls_port, "native binary", args.release_version, commit, tls_certificate,
+        ))
+        (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+        native_tls_context = verified_tls_context(tls_certificate)
+        check_versions(native_tls_base, "native replay of JVM registrations", subjects, native_tls_context)
+        register_native_schemas(native_tls_base, subjects, native_tls_context)
         run([*prefix, "stop", "-t", "45", "native"])
         run([*prefix, "up", "-d", "native"])
         wait_http(native_base, args.ready_timeout)
         check_container_image(args.engine, prefix, provenance["nativeImage"]["id"])
         check_runtime_version(native_base, "restarted native binary", args.release_version, commit)
-        check_versions(native_base, "restarted native binary", subjects)
+        provenance["tlsChecks"].extend(check_tls(
+            native_tls_port, "restarted native binary", args.release_version, commit, tls_certificate,
+        ))
+        (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+        check_versions(
+            native_tls_base, "restarted native binary", subjects,
+            verified_tls_context(tls_certificate),
+        )
         run([*prefix, "logs", "--no-color", "broker", "native"], log=run_dir / "native.log")
         provenance["agentMetadata"] = [
             {"path": str(path.relative_to(run_dir)), "sha256": sha256(path)}
@@ -681,9 +909,18 @@ def main() -> int:
             if failure is None:
                 failure = cleanup_error
     if failure:
-        (run_dir / "result.json").write_text(json.dumps({"status": "failed", "error": str(failure)}, indent=2) + "\n", encoding="utf-8")
+        (run_dir / "result.json").write_text(
+            json.dumps({
+                "status": "failed", "error": str(failure),
+                "tlsChecks": provenance["tlsChecks"],
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
         raise failure
-    (run_dir / "result.json").write_text(json.dumps({"status": "passed", "project": project}, indent=2) + "\n", encoding="utf-8")
+    (run_dir / "result.json").write_text(
+        json.dumps({"status": "passed", "project": project, "tlsChecks": provenance["tlsChecks"]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(f"Workflow passed; artifacts: {run_dir}", flush=True)
     return 0
 
