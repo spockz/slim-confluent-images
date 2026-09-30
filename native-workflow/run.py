@@ -134,22 +134,23 @@ def check_runtime_version(base: str, label: str, release_version: str, commit: s
         )
 
 
-def check_container_image(engine: str, compose_prefix: list[str], image_id: str) -> None:
-    container = run([*compose_prefix, "ps", "-q", "native"]).strip()
+def check_container_image(engine: str, compose_prefix: list[str], image_id: str,
+                          service: str = "native") -> None:
+    container = run([*compose_prefix, "ps", "-q", service]).strip()
     if not container:
-        raise WorkflowError("Compose did not report a running native container")
+        raise WorkflowError(f"Compose did not report a running {service} container")
     inspected = json.loads(run([engine, "inspect", container], capture_all=True))
     record = inspected[0] if isinstance(inspected, list) else inspected
     if record.get("Image") != image_id:
         raise WorkflowError(
-            f"Running native container uses image {record.get('Image')}, expected {image_id}"
+            f"Running {service} container uses image {record.get('Image')}, expected {image_id}"
         )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schema-repo", type=Path, default=Path("../schema-registry"))
-    parser.add_argument("--schema-ref", default="origin/8.2.0-native")
+    parser.add_argument("--schema-ref", default="8.2.0-native")
     parser.add_argument("--release-version", default="8.2.0")
     parser.add_argument("--platform", choices=("linux/amd64", "linux/arm64"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/native-workflow"))

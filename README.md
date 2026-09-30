@@ -1,7 +1,7 @@
 <!-- Keep workflow entry points here and detailed commands in their workflow guides. -->
 # Slim confluent images
 
-The repeatable source build, GraalVM instrumentation, native compilation, and functional test sequence is documented in [native-workflow/README.md](native-workflow/README.md). It supports the original `8.2.0-native` patch and the `v8.3.2` port.
+The repeatable source build, GraalVM instrumentation, native compilation, and functional test sequence is documented in [native-workflow/README.md](native-workflow/README.md). It supports the `8.2.0-native` and `native-8.3.2` branches. Run `python3 native-workflow/build_images.py` to build, test, and package both releases as local native and instrumented Docker images. The release workflow publishes both versions on AMD64 and ARM64.
 
 # Schema Registry
 

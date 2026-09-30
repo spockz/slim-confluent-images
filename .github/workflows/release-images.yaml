@@ -1,116 +1,97 @@
+# Publish both release branches only after fresh instrumentation and functional checks.
 name: Build and Publish Native Schema Registry
-
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/schema-registry-native
-  INSTRUMENTED_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/kafka-schema-registry-graalvm-instrumented
-  VERSION: 8.2.0
 
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/schema-registry-native
+  INSTRUMENTED_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/kafka-schema-registry-graalvm-instrumented
+
 jobs:
   build:
-    name: Build (${{ matrix.arch }})
+    name: Build ${{ matrix.version }} (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
+        version: ["8.2.0", "8.3.2"]
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-24.04
             platform: linux/amd64
-          - arch: aarch64
+          - arch: arm64
             runner: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clone schema-registry
-        run: git clone https://github.com/spockz/schema-registry.git -b 8.2.0-native
+      - name: Clone both Schema Registry branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/spockz/schema-registry.git schema-registry
+          git -C schema-registry branch 8.2.0-native origin/8.2.0-native
+          git -C schema-registry branch native-8.3.2 origin/native-8.3.2
 
       - name: Set up Oracle GraalVM
         uses: graalvm/setup-graalvm@v1
         with:
-          java-version: "25.0.2"
+          java-version: "25.0.4"
           distribution: "graalvm"
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Cache Maven repository
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository
-          key: ${{ runner.os }}-${{ runner.arch }}-maven-${{ hashFiles('schema-registry/**/pom.xml') }}
-          save-always: true
+          key: ${{ runner.os }}-${{ runner.arch }}-maven-${{ matrix.version }}-${{ hashFiles('native-workflow/*.py') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-maven-
+            ${{ runner.os }}-${{ runner.arch }}-maven-${{ matrix.version }}-
 
-      - name: Build native binary
-        working-directory: schema-registry
+      - name: Build and test deployment images
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ matrix.version }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
-          ./mvnw versions:set -DnewVersion=8.2.0
-          ./mvnw clean package -Pstandalone,native -pl package-schema-registry/ "-Dio.confluent.schema-registry.version=8.2.0"
+          set -euo pipefail
+          python3 native-workflow/build_images.py \
+            --schema-repo schema-registry \
+            --version "$RELEASE_VERSION" \
+            --platform "$TARGET_PLATFORM" \
+            --image-name "${IMAGE_NAME,,}" \
+            --instrumented-image-name "${INSTRUMENTED_IMAGE_NAME,,}"
 
-      - name: Stage binary
-        run: |
-          cp schema-registry/package-schema-registry/target/kafka-schema-registry-package \
-             schema-registry-native-${{ env.VERSION }}-${{ matrix.arch }}
-          cp schema-registry-native-${{ env.VERSION }}-${{ matrix.arch }} \
-             native-image/kafka-schema-registry-package
-
-      - name: Upload binary artifact
+      - name: Upload build provenance and logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: schema-registry-native-${{ env.VERSION }}-${{ matrix.arch }}
-          path: schema-registry-native-${{ env.VERSION }}-${{ matrix.arch }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push arch-specific image
-        uses: docker/build-push-action@v6
-        with:
-          context: native-image
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-${{ matrix.arch }}
-
-  build-instrumented:
-    name: Build instrumented (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          name: schema-registry-${{ matrix.version }}-${{ matrix.arch }}
+          path: |
+            artifacts/native-images/images.json
+            artifacts/native-images/**/provenance.json
+            artifacts/native-images/**/result.json
+            artifacts/native-images/**/smoke.json
+            artifacts/native-images/**/*.log
+            artifacts/native-images/**/metadata/*.json
+            artifacts/native-images/**/schema-registry.native
+          if-no-files-found: warn
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -119,21 +100,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push arch-specific instrumented image
-        uses: docker/build-push-action@v6
-        with:
-          context: instrument
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ env.INSTRUMENTED_IMAGE_NAME }}:${{ env.VERSION }}-${{ matrix.arch }}
+      - name: Push verified architecture images
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ matrix.version }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE_NAME,,}:$RELEASE_VERSION-$TARGET_ARCH"
+          docker push "${INSTRUMENTED_IMAGE_NAME,,}:$RELEASE_VERSION-$TARGET_ARCH"
 
   publish-manifest:
-    name: Publish multi-arch manifest
+    name: Publish ${{ matrix.version }} multi-arch images
     needs: build
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        version: ["8.2.0", "8.3.2"]
     permissions:
       packages: write
-
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -145,36 +130,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifest
+      - name: Create and push version manifests
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ matrix.version }}
         run: |
-          docker buildx imagetools create \
-            --tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }} \
-            --tag ${{ env.IMAGE_NAME }}:latest \
-            ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-amd64 \
-            ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-aarch64
-
-  publish-manifest-instrumented:
-    name: Publish multi-arch instrumented manifest
-    needs: build-instrumented
-    runs-on: ubuntu-24.04
-    permissions:
-      packages: write
-
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push multi-arch instrumented manifest
-        run: |
-          docker buildx imagetools create \
-            --tag ${{ env.INSTRUMENTED_IMAGE_NAME }}:${{ env.VERSION }} \
-            --tag ${{ env.INSTRUMENTED_IMAGE_NAME }}:latest \
-            ${{ env.INSTRUMENTED_IMAGE_NAME }}:${{ env.VERSION }}-amd64 \
-            ${{ env.INSTRUMENTED_IMAGE_NAME }}:${{ env.VERSION }}-aarch64
+          set -euo pipefail
+          for image in "${IMAGE_NAME,,}" "${INSTRUMENTED_IMAGE_NAME,,}"; do
+            tags=(--tag "$image:$RELEASE_VERSION")
+            if [[ "$RELEASE_VERSION" == "8.3.2" ]]; then
+              tags+=(--tag "$image:latest")
+            fi
+            docker buildx imagetools create "${tags[@]}" \
+              "$image:$RELEASE_VERSION-amd64" \
+              "$image:$RELEASE_VERSION-arm64"
+          done

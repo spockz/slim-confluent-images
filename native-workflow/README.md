@@ -1,4 +1,4 @@
-<!-- Keep this guide scoped to the opt-in workflow; the repository root Compose files are legacy experiments. -->
+<!-- Keep source and image build instructions here; the repository root Compose files are legacy experiments. -->
 # Schema Registry native workflow
 
 `run.py` builds an isolated Schema Registry image from a Git archive, starts a Kafka broker, collects fresh GraalVM reachability metadata from a JVM run, compiles that same standalone JAR into a Linux native executable, and checks behavior across the JVM and native runtimes.
@@ -14,7 +14,7 @@ From this repository, use the source checkout next to it:
 ```sh
 python3 native-workflow/run.py \
   --schema-repo ../schema-registry \
-  --schema-ref origin/8.2.0-native \
+  --schema-ref 8.2.0-native \
   --release-version 8.2.0 \
   --platform linux/arm64
 ```
@@ -24,12 +24,12 @@ Use the 8.3.2 source ref and version in a second invocation:
 ```sh
 python3 native-workflow/run.py \
   --schema-repo ../schema-registry \
-  --schema-ref codex/native-8.3.2 \
+  --schema-ref native-8.3.2 \
   --release-version 8.3.2 \
   --platform linux/arm64
 ```
 
-The default reference is `origin/8.2.0-native`, the default release is `8.2.0`, and the default target follows the container engine's architecture. The requested target must match the engine because GraalVM native-image compiles for the platform on which it runs. Set `CONTAINER_ENGINE=podman` to use Podman; otherwise Docker Compose is selected. The engine and its Compose provider must be installed and running.
+The default reference is `8.2.0-native`, the default release is `8.2.0`, and the default target follows the container engine's architecture. The requested target must match the engine because GraalVM native-image compiles for the platform on which it runs. Set `CONTAINER_ENGINE=podman` to use Podman; otherwise Docker Compose is selected. The engine and its Compose provider must be installed and running.
 
 When the standalone JAR was already built from the selected source archive, pass it with `--jar /path/to/kafka-schema-registry-package-VERSION-standalone.jar`. The runner still archives the selected ref to record its commit and read any legacy native-image arguments from the package POM. Ensure the supplied JAR was built from that ref and release version and contains the merged JDK ALPN service provider. An old JAR assembled without that merge is rejected; omit `--jar` to rebuild the legacy source with the correction.
 
@@ -39,7 +39,7 @@ If a stage fails, the runner keeps the run directory and writes available contai
 
 ## Validation
 
-On 2026-09-30, both `origin/8.2.0-native` and the `v8.3.2` port passed the runner's Maven source build, JVM HTTPS instrumentation, native image build, verified TLS 1.2 and TLS 1.3 connections, certificate rejection, HTTPS schema operations, and restart checks on Linux ARM64 with GraalVM 25.0.4. Additional probes confirmed explicit HTTP/1.1 ALPN negotiation on both native binaries. The Maven `native:compile-no-fork` entry point was also verified in Linux, preserving its input JAR.
+On 2026-09-30, both `8.2.0-native` and `native-8.3.2` passed the runner's Maven source build, JVM HTTPS instrumentation, native image build, verified TLS 1.2 and TLS 1.3 connections, certificate rejection, HTTPS schema operations, and restart checks on Linux ARM64 with GraalVM 25.0.4. Additional probes confirmed explicit HTTP/1.1 ALPN negotiation on both native binaries. The Maven `native:compile-no-fork` entry point was also verified in Linux, preserving its input JAR. The dual-image builder also passed separate deployment-image boot, TLS, stored-subject, and instrumentation-output checks for both releases.
 
 Each run creates an RSA 2048 self-signed certificate with a `localhost` SAN and PKCS12 keystore using `keytool` from the pinned GraalVM image. The JVM and native contexts receive the keystore and truststore; the native runtime copies them with read-only permissions for UID 10001. The REST listener accepts both HTTP and HTTPS, with HTTPS restricted to TLS 1.2 and TLS 1.3. The broker remains plaintext. JSSE handshake diagnostics are included in the retained agent and native container logs, and `result.json` records negotiated protocols, ciphers, peer certificates, and certificate-rejection checks.
 
@@ -49,6 +49,41 @@ These checks use a single plaintext Kafka broker. Other deployment configuration
 
 The old standalone assembly unpacked conflicting service-provider files without merging them. The resulting `META-INF/services/org.eclipse.jetty.io.ssl.ALPNProcessor$Server` retained only Confluent's Bouncy Castle provider and dropped Jetty's `JDK9ServerALPNProcessor`. With the default SunJSSE engine, Jetty rejected the accepted socket with `No ALPN Processor for sun.security.ssl.SSLEngineImpl` before consuming ClientHello. This occurs on the matching JVM as well as native and explains why JSSE handshake logs contain no handshake exchange.
 
-The 8.3.2 Schema Registry branch fixes the assembly with Maven's `metaInf-services` descriptor handler. The runner applies the same correction only in its private 8.2.0 source snapshot, preserving the original branch. It collects metadata from actual HTTPS requests before native compilation and tests TLS 1.2 and TLS 1.3 independently, including certificate verification failures and schema operations after native restart.
+The 8.3.2 Schema Registry branch fixes the assembly with Maven's `metaInf-services` descriptor handler. Both `8.2.0-native` and `native-8.3.2` now include this correction. For older 8.2.0 refs, the runner still applies it in the private source snapshot. It collects metadata from actual HTTPS requests before native compilation and tests TLS 1.2 and TLS 1.3 independently, including certificate verification failures and schema operations after native restart.
 
 An independent assembly collision overwrites Log4j's binary `Log4j2Plugins.dat` cache with a smaller dependency cache. It prevents normal Log4j configuration and can hide Jetty diagnostics. Service-descriptor merging does not fix that cache; its merge remains a separate packaging issue. JSSE diagnostics in this workflow are written directly to standard error.
+
+## Build both release images
+
+From this repository:
+
+```sh
+python3 native-workflow/build_images.py
+```
+
+This builds `8.2.0-native` as 8.2.0 and `native-8.3.2` as 8.3.2 from the neighboring Schema Registry checkout. Each version runs the complete source build, instrumentation, native compilation, HTTPS workload, and restart checks before packaging deployment images. The deployment images are booted and checked separately with mounted configuration. No test certificates or broker settings are included in them.
+
+The default local tags are:
+
+| Image | Version tags | Architecture tags |
+| --- | --- | --- |
+| `schema-registry-native` | `8.2.0`, `8.3.2` | `8.2.0-arm64`, `8.3.2-arm64` on ARM64; `-amd64` on AMD64 |
+| `kafka-schema-registry-graalvm-instrumented` | `8.2.0`, `8.3.2` | The same architecture suffixes |
+
+Use `--version 8.3.2` to build one release. `--schema-repo`, `--platform`, `--engine`, and `--maven` select the source checkout and build tools. `--image-name` and `--instrumented-image-name` select image repositories. Native compilation requires a container engine running the requested architecture. The default command builds the current architecture; GitHub Actions builds both AMD64 and ARM64 on their matching runners.
+
+Build records and logs are retained under `artifacts/native-images/`. `images.json` records the source commits, input hashes, image identities, and tags after all requested builds succeed. Local builds do not push images or assign a `latest` tag.
+
+Deployment images use UID 10001 and accept a mounted Schema Registry properties file:
+
+```sh
+docker run --rm -p 8081:8081 \
+  -v "$PWD/schema-registry.properties:/etc/schema-registry.properties:ro" \
+  schema-registry-native:8.3.2
+```
+
+The properties file must specify reachable Kafka bootstrap servers and listeners. Mount your own keystore and truststore for HTTPS and reference their container paths in that file. Mounted properties and TLS files must be readable by UID 10001. These images use the properties-file interface instead of the old Confluent environment-variable wrapper. Additional native runtime arguments can precede the properties-file path after the image name.
+
+The instrumented image uses the same properties-file interface and writes agent metadata to `/opt/reachability`. Mount a directory writable by UID 10001 there to keep metadata. Stop the container gracefully so the agent flushes it.
+
+`.github/workflows/release-images.yaml` builds and verifies both versions on AMD64 and ARM64, publishes native and instrumented architecture images, then creates version manifests. Only 8.3.2 receives `latest`. The workflow requires the updated `8.2.0-native` and renamed `native-8.3.2` branches to be pushed to the Schema Registry fork first.

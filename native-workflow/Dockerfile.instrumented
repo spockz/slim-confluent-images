@@ -1,0 +1,17 @@
+# This image runs the matching JVM artifact with a writable agent output directory for deployment-time reachability collection.
+ARG GRAAL_IMAGE
+FROM ${GRAAL_IMAGE}
+
+ARG RELEASE_VERSION
+ARG SCHEMA_REVISION
+LABEL org.opencontainers.image.version="${RELEASE_VERSION}" \
+      org.opencontainers.image.revision="${SCHEMA_REVISION}"
+
+COPY --chown=10001:0 schema-registry.jar /opt/app/schema-registry.jar
+RUN mkdir -p /opt/reachability \
+    && chown 10001:0 /opt/reachability \
+    && chmod 0775 /opt/reachability
+
+USER 10001
+ENTRYPOINT ["java", "-agentlib:native-image-agent=config-merge-dir=/opt/reachability", "-jar", "/opt/app/schema-registry.jar"]
+CMD ["/etc/schema-registry.properties"]

@@ -3,4 +3,5 @@ graalvm-reachability-metadata-*
 java
 var/lib/alternatives
 artifacts/native-workflow/
+artifacts/native-images/
 __pycache__/
