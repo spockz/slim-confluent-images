@@ -346,24 +346,38 @@ def generate_tls_material(engine: str, graal_image: str, run_dir: Path) -> None:
     certificate = tls_dir / "server.pem"
     truststore = tls_dir / "truststore.p12"
     password = "native-workflow-test"
-    mount = f"{tls_dir}:/tls"
-    run([
-        engine, "run", "--rm", "-v", mount, "--entrypoint", "keytool", graal_image,
+    commands = [[
+        "keytool",
         "-genkeypair", "-alias", "schema-registry", "-keyalg", "RSA", "-keysize", "2048",
         "-validity", "2", "-dname", "CN=localhost", "-ext", "SAN=dns:localhost",
         "-storetype", "PKCS12", "-keystore", "/tls/server.p12", "-storepass", password,
         "-keypass", password, "-noprompt",
-    ])
-    run([
-        engine, "run", "--rm", "-v", mount, "--entrypoint", "keytool", graal_image,
+    ], [
+        "keytool",
         "-exportcert", "-rfc", "-alias", "schema-registry", "-keystore", "/tls/server.p12",
         "-storepass", password, "-file", "/tls/server.pem",
-    ])
-    run([
-        engine, "run", "--rm", "-v", mount, "--entrypoint", "keytool", graal_image,
+    ], [
+        "keytool",
         "-importcert", "-noprompt", "-alias", "schema-registry", "-file", "/tls/server.pem",
         "-storetype", "PKCS12", "-keystore", "/tls/truststore.p12", "-storepass", password,
-    ])
+    ]]
+    script = "set -eu\nmkdir -p /tls\n" + "\n".join(shlex.join(command) for command in commands)
+    container = run([
+        engine, "create", "--name", "srnative-tls-" + uuid.uuid4().hex[:12],
+        "--entrypoint", "/bin/sh", graal_image, "-c", script,
+    ]).strip()
+    try:
+        run([engine, "start", "--attach", container])
+        inspected = json.loads(run([engine, "inspect", container], capture_all=True))
+        record = inspected[0] if isinstance(inspected, list) else inspected
+        state = record["State"]
+        if state.get("Status") != "exited" or state.get("ExitCode") != 0:
+            raise WorkflowError(f"TLS generation container did not exit successfully: {state}")
+        # Copying through the host client avoids root-owned files in a bind mount.
+        for path in (keystore, certificate, truststore):
+            run([engine, "cp", f"{container}:/tls/{path.name}", str(path)])
+    finally:
+        run([engine, "rm", "--force", container])
     for path in (keystore, certificate, truststore):
         if not path.is_file() or path.stat().st_size == 0:
             raise WorkflowError(f"keytool did not create TLS material: {path}")
@@ -376,6 +390,8 @@ def write_context(run_dir: Path, jar: Path, native_args: list[str], graal_image:
     native = run_dir / "native"
     for path in (agent, native, run_dir / "metadata", run_dir / "kafka-data"):
         path.mkdir(parents=True, exist_ok=True)
+    # Kafka's UID differs from the host runner's UID on rootful Linux engines.
+    (run_dir / "kafka-data").chmod(0o777)
     for context in (agent, native):
         shutil.copy2(jar, context / "schema-registry.jar")
         shutil.copy2(run_dir / "tls" / "server.p12", context / "server.p12")
