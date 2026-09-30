@@ -1,3 +1,6 @@
+# Keep generated native build inputs, binaries, and caches out of source control.
 graalvm-reachability-metadata-*
 java
 var/lib/alternatives
+artifacts/native-workflow/
+__pycache__/

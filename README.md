@@ -1,4 +1,7 @@
+<!-- Keep workflow entry points here and detailed commands in their workflow guides. -->
 # Slim confluent images
+
+The repeatable source build, GraalVM instrumentation, native compilation, and functional test sequence is documented in [native-workflow/README.md](native-workflow/README.md). It supports the original `8.2.0-native` patch and the `v8.3.2` port.
 
 # Schema Registry
 
