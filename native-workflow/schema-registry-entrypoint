@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Share the upstream environment renderer between both runtimes; Schema Registry itself waits for Kafka without the legacy Java readiness stub.
+set -euo pipefail
+
+runtime="${1:?Runtime must be native or instrumented}"
+shift
+
+if [[ $# -eq 0 ]]; then
+    /etc/confluent/docker/configure
+    set -- /etc/schema-registry/schema-registry.properties
+fi
+
+options=()
+if [[ -n "${SCHEMA_REGISTRY_OPTS:-}" ]]; then
+    read -r -a options <<< "$SCHEMA_REGISTRY_OPTS"
+fi
+
+case "$runtime" in
+    native)
+        exec /usr/local/bin/schema-registry "${options[@]}" "$@"
+        ;;
+    instrumented)
+        exec java "${options[@]}" \
+            -agentlib:native-image-agent=config-merge-dir=/opt/reachability \
+            -jar /opt/app/schema-registry.jar "$@"
+        ;;
+    *)
+        printf 'Unknown runtime: %s\n' "$runtime" >&2
+        exit 1
+        ;;
+esac

@@ -1,5 +1,7 @@
-# This image runs the matching JVM artifact with a writable agent output directory for deployment-time reachability collection.
+# Preserve environment-based configuration when running the matching JVM artifact with deployment-time reachability collection.
+ARG CONFIGURATION_IMAGE
 ARG GRAAL_IMAGE
+FROM ${CONFIGURATION_IMAGE} AS configuration
 FROM ${GRAAL_IMAGE}
 
 ARG RELEASE_VERSION
@@ -8,10 +10,14 @@ LABEL org.opencontainers.image.version="${RELEASE_VERSION}" \
       org.opencontainers.image.revision="${SCHEMA_REVISION}"
 
 COPY --chown=10001:0 schema-registry.jar /opt/app/schema-registry.jar
-RUN mkdir -p /opt/reachability \
-    && chown 10001:0 /opt/reachability \
-    && chmod 0775 /opt/reachability
+COPY --from=configuration /usr/bin/ub /usr/bin/ub
+COPY --from=configuration /etc/confluent/docker /etc/confluent/docker
+COPY schema-registry-entrypoint /usr/local/bin/schema-registry-entrypoint
+RUN mkdir -p /opt/reachability /etc/schema-registry \
+    && chown 10001:0 /opt/reachability /etc/schema-registry \
+    && chmod 0775 /opt/reachability /etc/schema-registry
 
+ENV COMPONENT=schema-registry USE_LOG4J_2=True
 USER 10001
-ENTRYPOINT ["java", "-agentlib:native-image-agent=config-merge-dir=/opt/reachability", "-jar", "/opt/app/schema-registry.jar"]
-CMD ["/etc/schema-registry.properties"]
+ENTRYPOINT ["/usr/local/bin/schema-registry-entrypoint", "instrumented"]
+CMD []

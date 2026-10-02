@@ -1,5 +1,7 @@
-# This runtime image contains only the verified native executable so deployment stays small while provenance remains in the build manifest.
+# Keep the existing Confluent environment renderer alongside the verified binary so deployments retain their startup configuration contract.
+ARG CONFIGURATION_IMAGE
 ARG RUNTIME_IMAGE
+FROM ${CONFIGURATION_IMAGE} AS configuration
 FROM ${RUNTIME_IMAGE}
 
 ARG RELEASE_VERSION
@@ -8,8 +10,14 @@ LABEL org.opencontainers.image.version="${RELEASE_VERSION}" \
       org.opencontainers.image.revision="${SCHEMA_REVISION}"
 
 COPY --chown=10001:0 schema-registry /usr/local/bin/schema-registry
-RUN mkdir -p /opt/app
+COPY --from=configuration /usr/bin/ub /usr/bin/ub
+COPY --from=configuration /etc/confluent/docker /etc/confluent/docker
+COPY schema-registry-entrypoint /usr/local/bin/schema-registry-entrypoint
+RUN mkdir -p /opt/app /etc/schema-registry \
+    && chown 10001:0 /etc/schema-registry \
+    && chmod 0775 /etc/schema-registry
 
+ENV COMPONENT=schema-registry USE_LOG4J_2=True
 USER 10001
-ENTRYPOINT ["/usr/local/bin/schema-registry"]
-CMD ["/etc/schema-registry.properties"]
+ENTRYPOINT ["/usr/local/bin/schema-registry-entrypoint", "native"]
+CMD []

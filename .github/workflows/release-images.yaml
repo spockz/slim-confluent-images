@@ -1,10 +1,16 @@
-# Publish both release branches only after fresh instrumentation and functional checks.
+# Reuse reviewed metadata for releases; manual refresh runs collect candidates without publishing images.
 name: Build and Publish Native Schema Registry
 
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      metadata_mode:
+        description: Reuse committed metadata, or refresh it without publishing images
+        type: choice
+        options: [build, refresh]
+        default: build
 
 permissions:
   contents: read
@@ -69,12 +75,15 @@ jobs:
         env:
           RELEASE_VERSION: ${{ matrix.version }}
           TARGET_PLATFORM: ${{ matrix.platform }}
+          METADATA_MODE: ${{ inputs.metadata_mode || 'build' }}
         run: |
           set -euo pipefail
+          python3 -m unittest discover -s native-workflow/tests
           python3 native-workflow/build_images.py \
             --schema-repo schema-registry \
             --version "$RELEASE_VERSION" \
             --platform "$TARGET_PLATFORM" \
+            --metadata-mode "$METADATA_MODE" \
             --image-name "${IMAGE_NAME,,}" \
             --instrumented-image-name "${INSTRUMENTED_IMAGE_NAME,,}"
 
@@ -90,10 +99,14 @@ jobs:
             artifacts/native-images/**/smoke.json
             artifacts/native-images/**/*.log
             artifacts/native-images/**/metadata/*.json
+            artifacts/native-images/**/committed-metadata/**/*.json
+            artifacts/native-images/**/native/reachability/**/*
             artifacts/native-images/**/schema-registry.native
+            native-workflow/metadata/**
           if-no-files-found: warn
 
       - name: Log in to GHCR
+        if: inputs.metadata_mode != 'refresh'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -101,6 +114,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push verified architecture images
+        if: inputs.metadata_mode != 'refresh'
         shell: bash
         env:
           RELEASE_VERSION: ${{ matrix.version }}
@@ -113,6 +127,7 @@ jobs:
   publish-manifest:
     name: Publish ${{ matrix.version }} multi-arch images
     needs: build
+    if: inputs.metadata_mode != 'refresh'
     runs-on: ubuntu-24.04
     strategy:
       matrix:

@@ -18,6 +18,7 @@ import ssl
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -67,6 +68,8 @@ def run(command: list[str], *, cwd: Path | None = None, log: Path | None = None,
                 output_stream.flush()
         return_code = process.wait()
     finally:
+        if process.stdout is not None:
+            process.stdout.close()
         if output_stream:
             output_stream.close()
     output = "".join(complete if complete is not None else tail)
@@ -155,6 +158,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--platform", choices=("linux/amd64", "linux/arm64"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/native-workflow"))
     parser.add_argument("--jar", type=Path, help="Use a previously built standalone JAR")
+    parser.add_argument("--metadata-mode", choices=("build", "refresh"), default="build",
+                        help="Reuse saved metadata (default), or instrument and save an additive refresh after tests pass")
+    parser.add_argument("--metadata-dir", type=Path,
+                        help="Saved metadata directory (default: native-workflow/metadata/VERSION)")
     parser.add_argument("--maven", default=os.environ.get("MAVEN", "mvn"))
     parser.add_argument("--engine", choices=("docker", "podman"), default=os.environ.get("CONTAINER_ENGINE", "docker"))
     parser.add_argument("--ready-timeout", type=int, default=240)
@@ -202,33 +209,154 @@ def source_snapshot(repo: Path, ref: str, destination: Path) -> str:
     return commit
 
 
-def remove_stale_metadata(source: Path) -> None:
-    for path in source.rglob("META-INF/native-image"):
-        if not path.is_dir():
-            continue
-        for metadata in (path / "reachability-metadata.json",):
-            if metadata.exists():
-                metadata.unlink()
-        for metadata_dir in (path / "test", path / "instrumented-reachability-metadata"):
-            if metadata_dir.exists():
-                shutil.rmtree(metadata_dir)
+def collect_committed_metadata(source: Path, run_dir: Path) -> list[dict]:
+    records = []
+    for metadata in sorted(source.glob("**/src/main/resources/META-INF/native-image/**/reachability-metadata.json")):
+        relative = metadata.relative_to(source)
+        try:
+            document = json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise WorkflowError(f"Invalid committed reachability metadata {relative}: {error}") from error
+        if not isinstance(document, dict):
+            raise WorkflowError(f"Committed reachability metadata must be an object: {relative}")
+        destination = run_dir / "committed-metadata" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(metadata, destination)
+        records.append({"source": str(relative), "path": str(destination.relative_to(run_dir)),
+                        "sha256": sha256(destination)})
+    return records
 
 
-def scrub_jar_metadata(jar: Path) -> None:
-    temporary = jar.with_suffix(".clean.jar")
-    with zipfile.ZipFile(jar) as incoming, zipfile.ZipFile(temporary, "w") as outgoing:
-        for item in incoming.infolist():
-            parts = Path(item.filename).parts
-            try:
-                metadata_root = parts.index("native-image")
-            except ValueError:
-                metadata_root = -1
-            metadata_path = parts[metadata_root + 1:] if metadata_root >= 0 else ()
-            if (metadata_path == ("reachability-metadata.json",)
-                    or metadata_path[:1] in {("test",), ("instrumented-reachability-metadata",)}):
-                continue
-            outgoing.writestr(item, incoming.read(item.filename))
-    temporary.replace(jar)
+def read_json_object(path: Path) -> dict:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkflowError(f"Could not read JSON document {path}: {error}") from error
+    if not isinstance(document, dict):
+        raise WorkflowError(f"JSON document must be an object: {path}")
+    return document
+
+
+def collect_saved_metadata(directory: Path, run_dir: Path, version: str, commit: str,
+                           *, refresh: bool) -> tuple[list[dict], dict | None]:
+    if not directory.exists() and refresh:
+        return [], None
+    if not directory.is_dir():
+        raise WorkflowError(f"Saved metadata is missing: {directory}; run with --metadata-mode refresh first")
+    manifest = read_json_object(directory / "manifest.json")
+    if manifest.get("formatVersion") != 1 or manifest.get("releaseVersion") != version:
+        raise WorkflowError(f"Saved metadata format or release does not match {version}: {directory}")
+    if not refresh and (manifest.get("schemaCommit") != commit or manifest.get("graalvm") != GRAAL_IMAGE):
+        raise WorkflowError(f"Saved metadata source commit or GraalVM version changed; refresh {directory} before building")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise WorkflowError(f"Saved metadata manifest has no files: {directory}")
+    paths = []
+    records = []
+    for record in files:
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            raise WorkflowError(f"Invalid saved metadata file record: {record!r}")
+        relative = Path(record["path"])
+        # Keep manifests confined to a flat configuration directory; never copy arbitrary repository paths.
+        if relative.parts != ("configuration", relative.name) or relative.suffix != ".json":
+            raise WorkflowError(f"Invalid saved metadata path: {relative}")
+        path = directory / relative
+        if path.is_symlink() or not path.is_file() or sha256(path) != record.get("sha256"):
+            raise WorkflowError(f"Saved metadata hash mismatch or missing file: {path}")
+        if relative in paths:
+            raise WorkflowError(f"Duplicate saved metadata path: {relative}")
+        paths.append(relative)
+        destination = run_dir / "saved-metadata" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+        records.append({"source": str(path), "path": str(destination.relative_to(run_dir)),
+                        "sha256": sha256(destination)})
+    actual = {path.relative_to(directory) for path in (directory / "configuration").iterdir()}
+    if actual != set(paths):
+        raise WorkflowError(f"Saved metadata contains files not recorded in its manifest: {directory}")
+    return records, manifest
+
+
+def save_metadata(run_dir: Path, directory: Path) -> None:
+    provenance = read_json_object(run_dir / "provenance.json")
+    result = read_json_object(run_dir / "result.json")
+    if result.get("status") != "passed":
+        raise WorkflowError("Cannot save metadata from a failed or unverified run")
+    files = provenance.get("mergedMetadata")
+    if not isinstance(files, list) or not files:
+        raise WorkflowError("Cannot save metadata without recorded merged inputs")
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".metadata-", dir=directory.parent) as temporary:
+        staging = Path(temporary) / "snapshot"
+        configuration = staging / "configuration"
+        configuration.mkdir(parents=True)
+        records = []
+        for record in files:
+            relative = Path(record["path"])
+            if relative.parts != ("native", "reachability", relative.name) or relative.suffix != ".json":
+                raise WorkflowError(f"Invalid merged metadata path: {relative}")
+            source = run_dir / relative
+            if source.is_symlink() or sha256(source) != record["sha256"]:
+                raise WorkflowError(f"Merged metadata changed: {source}")
+            destination = configuration / source.name
+            shutil.copy2(source, destination)
+            records.append({"path": str(destination.relative_to(staging)), "sha256": sha256(destination)})
+        manifest = {
+            "formatVersion": 1, "releaseVersion": provenance["releaseVersion"],
+            "schemaCommit": provenance["schemaCommit"], "graalvm": provenance["imageTags"]["graalvm"],
+            "collectedPlatform": provenance["platform"], "jarSha256": provenance["jarSha256"],
+            "files": records,
+        }
+        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        backup = Path(temporary) / "previous"
+        if directory.exists():
+            directory.rename(backup)
+        try:
+            staging.rename(directory)
+        except OSError:
+            if backup.exists():
+                backup.rename(directory)
+            raise
+
+
+def merge_reachability_metadata(engine: str, graal_image: str, run_dir: Path,
+                               committed: list[dict]) -> list[dict]:
+    inputs = [run_dir / record["path"] for record in committed]
+    for path, record in zip(inputs, committed):
+        if sha256(path) != record["sha256"]:
+            raise WorkflowError(f"Input reachability metadata changed: {path}")
+    directories = [*dict.fromkeys(path.parent for path in inputs), run_dir / "metadata"]
+    command = [engine, "create", "--name", "srnative-metadata-" + uuid.uuid4().hex[:12],
+               "--entrypoint", "native-image-configure", graal_image, "generate"]
+    command.extend(f"--input-dir=/input-{index}" for index in range(len(directories)))
+    command.append("--output-dir=/merged")
+    merged_dir = run_dir / "native" / "reachability"
+    # A new output directory prevents stale generated entries from appearing in provenance.
+    merged_dir.mkdir(parents=True, exist_ok=False)
+    container = run(command).strip()
+    try:
+        for index, directory in enumerate(directories):
+            run([engine, "cp", str(directory), f"{container}:/input-{index}"])
+        run([engine, "start", "--attach", container], log=run_dir / "metadata-merge.log")
+        state = json.loads(run([engine, "inspect", "--format", "{{json .State}}", container],
+                               capture_all=True))
+        if state.get("Status") != "exited" or state.get("ExitCode") != 0:
+            raise WorkflowError(f"Reachability metadata merge did not exit successfully: {state}")
+        run([engine, "cp", f"{container}:/merged/.", str(merged_dir)])
+    finally:
+        run([engine, "rm", "--force", container])
+    files = sorted(merged_dir.glob("*.json"))
+    if not files:
+        raise WorkflowError("GraalVM metadata merge produced no configuration files")
+    for path in files:
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise WorkflowError(f"Invalid merged reachability metadata {path}: {error}") from error
+        if not isinstance(document, (dict, list)):
+            raise WorkflowError(f"Invalid merged reachability metadata document: {path}")
+    return [{"path": str(path.relative_to(run_dir)), "sha256": sha256(path)}
+            for path in sorted(merged_dir.rglob("*")) if path.is_file()]
 
 
 def normalize_source_versions(source: Path, release_version: str) -> None:
@@ -385,7 +513,7 @@ def generate_tls_material(engine: str, graal_image: str, run_dir: Path) -> None:
 
 
 def write_context(run_dir: Path, jar: Path, native_args: list[str], graal_image: str,
-                  runtime_image: str) -> None:
+                  runtime_image: str, *, instrument: bool = True) -> None:
     agent = run_dir / "agent"
     native = run_dir / "native"
     for path in (agent, native, run_dir / "metadata", run_dir / "kafka-data"):
@@ -413,13 +541,20 @@ def write_context(run_dir: Path, jar: Path, native_args: list[str], graal_image:
             "kafkastore.timeout.ms=10000\n",
             encoding="utf-8",
         )
+    java_options = ["java", "-Djavax.net.debug=ssl,handshake",
+                    "-Djavax.net.ssl.trustStore=/opt/app/truststore.p12",
+                    "-Djavax.net.ssl.trustStoreType=PKCS12",
+                    "-Djavax.net.ssl.trustStorePassword=native-workflow-test"]
+    if instrument:
+        java_options.append("-agentlib:native-image-agent=config-output-dir=/opt/reachability")
+    java_options.extend(("-jar", "/opt/app/schema-registry.jar", "/opt/app/schema-registry.properties"))
     (agent / "Dockerfile").write_text(
         f"FROM {graal_image}\n"
         "WORKDIR /opt/app\n"
         "COPY schema-registry.jar /opt/app/schema-registry.jar\n"
         "COPY schema-registry.properties /opt/app/schema-registry.properties\n"
         "COPY server.p12 truststore.p12 /opt/app/\n"
-        'ENTRYPOINT ["java", "-Djavax.net.debug=ssl,handshake", "-Djavax.net.ssl.trustStore=/opt/app/truststore.p12", "-Djavax.net.ssl.trustStoreType=PKCS12", "-Djavax.net.ssl.trustStorePassword=native-workflow-test", "-agentlib:native-image-agent=config-output-dir=/opt/reachability", "-jar", "/opt/app/schema-registry.jar", "/opt/app/schema-registry.properties"]\n',
+        f"ENTRYPOINT {json.dumps(java_options)}\n",
         encoding="utf-8",
     )
     options = ["--no-fallback", "-H:ConfigurationFileDirectories=/opt/reachability", *native_args]
@@ -755,7 +890,12 @@ def main() -> int:
     run_dir.mkdir()
     source = run_dir / "source"
     commit = source_snapshot(repo, args.schema_ref, source)
-    remove_stale_metadata(source)
+    committed_metadata = collect_committed_metadata(source, run_dir)
+    refresh = args.metadata_mode == "refresh"
+    metadata_directory = (args.metadata_dir or Path(__file__).parent / "metadata" / args.release_version).resolve()
+    saved_metadata, saved_manifest = collect_saved_metadata(
+        metadata_directory, run_dir, args.release_version, commit, refresh=refresh,
+    )
     normalize_source_versions(source, args.release_version)
     legacy_service_merge = merge_legacy_services(source, args.release_version)
     pom = source / "package-schema-registry" / "pom.xml"
@@ -768,8 +908,6 @@ def main() -> int:
             raise WorkflowError(f"Standalone JAR does not exist: {jar}")
         shutil.copy2(jar, run_dir / "schema-registry.jar")
         jar = run_dir / "schema-registry.jar"
-        if args.release_version == "8.2.0":
-            scrub_jar_metadata(jar)
         jar_origin = str(args.jar.resolve())
     else:
         build_log = run_dir / "maven-build.log"
@@ -811,6 +949,12 @@ def main() -> int:
         "imageTags": {"graalvm": GRAAL_IMAGE, "kafka": KAFKA_IMAGE, "runtime": RUNTIME_IMAGE},
         "nativeArgsFromPackagePom": native_args,
         "legacyServiceDescriptorMerge": legacy_service_merge and args.jar is None,
+        "metadataPolicy": "additive",
+        "metadataMode": args.metadata_mode,
+        "savedMetadataDirectory": str(metadata_directory),
+        "savedMetadataManifest": saved_manifest,
+        "savedMetadata": saved_metadata,
+        "committedMetadata": committed_metadata,
         "tlsChecks": [],
     }
     graal_ref, graal_inspection = pin_image(args.engine, GRAAL_IMAGE, args.platform)
@@ -839,7 +983,7 @@ def main() -> int:
         run_dir, project, args.platform, kafka_ref, agent_port, native_port,
         agent_tls_port, native_tls_port,
     )
-    write_context(run_dir, jar, native_args, graal_ref, runtime_ref)
+    write_context(run_dir, jar, native_args, graal_ref, runtime_ref, instrument=refresh)
     base = f"http://127.0.0.1:{agent_port}"
     tls_base = f"https://localhost:{agent_tls_port}"
     tls_certificate = run_dir / "tls" / "server.pem"
@@ -851,16 +995,17 @@ def main() -> int:
     try:
         run([*prefix, "up", "-d", "broker", "agent"], log=run_dir / "agent-build.log")
         wait_http(base, args.ready_timeout)
-        check_runtime_version(base, "instrumented JVM", args.release_version, commit)
+        jvm_label = "instrumented JVM" if refresh else "JVM control"
+        check_runtime_version(base, jvm_label, args.release_version, commit)
         provenance["tlsChecks"].extend(check_tls(
-            agent_tls_port, "instrumented JVM", args.release_version, commit, tls_certificate,
+            agent_tls_port, jvm_label, args.release_version, commit, tls_certificate,
         ))
         (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         subjects = register_jvm_schemas(tls_base, tls_context)
         run([*prefix, "stop", "-t", "45", "agent"])
         run([*prefix, "logs", "--no-color", "agent"], log=run_dir / "agent.log")
-        metadata_files = sorted((run_dir / "metadata").glob("*.json"))
-        if not metadata_files:
+        metadata_files = sorted((run_dir / "metadata").glob("*.json")) if refresh else []
+        if refresh and not metadata_files:
             raise WorkflowError("GraalVM agent produced no reachability JSON files")
         for metadata in metadata_files:
             with metadata.open(encoding="utf-8") as stream:
@@ -870,7 +1015,10 @@ def main() -> int:
             for path in metadata_files
         ]
         (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
-        shutil.copytree(run_dir / "metadata", run_dir / "native" / "reachability", dirs_exist_ok=True)
+        provenance["mergedMetadata"] = merge_reachability_metadata(
+            args.engine, graal_ref, run_dir, [*committed_metadata, *saved_metadata],
+        )
+        (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         run([*prefix, "build", "native"], log=run_dir / "native-build.log")
         native_image = f"{project}-native"
         provenance["nativeImage"] = inspect_image(args.engine, native_image)
@@ -938,6 +1086,9 @@ def main() -> int:
         json.dumps({"status": "passed", "project": project, "tlsChecks": provenance["tlsChecks"]}, indent=2) + "\n",
         encoding="utf-8",
     )
+    if refresh:
+        save_metadata(run_dir, metadata_directory)
+        print(f"Refreshed metadata: {metadata_directory}", flush=True)
     print(f"Workflow passed; artifacts: {run_dir}", flush=True)
     return 0
 

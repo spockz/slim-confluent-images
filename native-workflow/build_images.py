@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -32,24 +33,17 @@ def parse_args() -> argparse.Namespace:
                         default=os.environ.get("CONTAINER_ENGINE", "docker"))
     parser.add_argument("--platform", choices=("linux/amd64", "linux/arm64"))
     parser.add_argument("--maven", default=os.environ.get("MAVEN", "mvn"))
+    parser.add_argument("--metadata-mode", choices=("build", "refresh"), default="build")
+    parser.add_argument("--metadata-root", type=Path, default=Path(__file__).parent / "metadata",
+                        help="Saved metadata root with one directory per release")
     parser.add_argument("--image-name", default="schema-registry-native")
     parser.add_argument("--instrumented-image-name", default="kafka-schema-registry-graalvm-instrumented")
     return parser.parse_args()
 
 
-def json_file(path: Path) -> dict:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise workflow.WorkflowError(f"Could not read valid JSON from {path}: {error}") from error
-    if not isinstance(value, dict):
-        raise workflow.WorkflowError(f"Expected a JSON object in {path}")
-    return value
-
-
 def validate_run(run_dir: Path, version: str, schema_ref: str, platform: str) -> dict:
-    provenance = json_file(run_dir / "provenance.json")
-    result = json_file(run_dir / "result.json")
+    provenance = workflow.read_json_object(run_dir / "provenance.json")
+    result = workflow.read_json_object(run_dir / "result.json")
     expected = {
         "releaseVersion": version,
         "schemaRef": schema_ref,
@@ -103,8 +97,17 @@ def run_version(args: argparse.Namespace, version: str, platform: str) -> dict:
         "--output-dir", str(version_output),
         "--engine", args.engine,
         "--maven", args.maven,
+        "--metadata-mode", args.metadata_mode,
     ]
-    workflow.run(command)
+    metadata_directory = (args.metadata_root / version).resolve()
+    # Keep the reviewed snapshot intact until deployment image checks also pass.
+    with tempfile.TemporaryDirectory(prefix="metadata-candidate-", dir=args.output_dir) as temporary:
+        if args.metadata_mode == "refresh":
+            candidate = Path(temporary) / "snapshot"
+            if metadata_directory.exists():
+                shutil.copytree(metadata_directory, candidate)
+            metadata_directory = candidate
+        workflow.run([*command, "--metadata-dir", str(metadata_directory)])
     after = {path.resolve() for path in version_output.iterdir() if path.is_dir()}
     created = sorted(after - before)
     if len(created) != 1:
@@ -116,7 +119,8 @@ def run_version(args: argparse.Namespace, version: str, platform: str) -> dict:
 
 
 def build_image(args: argparse.Namespace, *, dockerfile: str, image_name: str,
-                version: str, platform: str, run_dir: Path, artifacts: dict) -> list[dict]:
+                version: str, platform: str, run_dir: Path, artifacts: dict,
+                configuration_image: str) -> list[dict]:
     architecture = platform.split("/", 1)[1]
     tags = [f"{image_name}:{version}-{architecture}", f"{image_name}:{version}"]
     provenance = artifacts["provenance"]
@@ -141,12 +145,16 @@ def build_image(args: argparse.Namespace, *, dockerfile: str, image_name: str,
         destination.chmod(mode)
         if workflow.sha256(destination) != expected_hash:
             raise workflow.WorkflowError(f"Copied artifact changed while preparing {run_dir}: {source}")
+        entrypoint = context / "schema-registry-entrypoint"
+        shutil.copy2(Path(__file__).with_name("schema-registry-entrypoint"), entrypoint)
+        entrypoint.chmod(0o555)
         command = [args.engine, "build", "--platform", platform, "-f",
                    str(Path(__file__).with_name(dockerfile))]
         for tag in tags:
             command.extend(("-t", tag))
         command.extend((
             "--build-arg", base_argument,
+            "--build-arg", f"CONFIGURATION_IMAGE={configuration_image}",
             "--build-arg", f"RELEASE_VERSION={version}",
             "--build-arg", f"SCHEMA_REVISION={provenance['schemaCommit']}",
             str(context),
@@ -161,6 +169,39 @@ def build_image(args: argparse.Namespace, *, dockerfile: str, image_name: str,
     return identities
 
 
+def deployment_environment(host: str) -> dict[str, str]:
+    return {
+        "SCHEMA_REGISTRY_HOST_NAME": host,
+        "SCHEMA_REGISTRY_LISTENERS": "http://0.0.0.0:8081,https://0.0.0.0:8082",
+        "SCHEMA_REGISTRY_SSL_KEYSTORE_LOCATION": "/opt/app/server.p12",
+        "SCHEMA_REGISTRY_SSL_KEYSTORE_TYPE": "PKCS12",
+        "SCHEMA_REGISTRY_SSL_KEYSTORE_PASSWORD": "native-workflow-test",
+        "SCHEMA_REGISTRY_SSL_KEY_PASSWORD": "native-workflow-test",
+        "SCHEMA_REGISTRY_SSL_PROTOCOL": "TLS",
+        "SCHEMA_REGISTRY_SSL_ENABLED_PROTOCOLS": "TLSv1.2,TLSv1.3",
+        "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS": "PLAINTEXT://broker:29092",
+        "SCHEMA_REGISTRY_KAFKASTORE_TOPIC": "_schemas_deployment_smoke",
+        "SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR": "1",
+        "SCHEMA_REGISTRY_KAFKASTORE_INIT_TIMEOUT_MS": "60000",
+        "SCHEMA_REGISTRY_KAFKASTORE_TIMEOUT_MS": "10000",
+    }
+
+
+def check_environment_startup(engine: str, prefix: list[str], service: str) -> dict:
+    container = workflow.run([*prefix, "ps", "-q", service]).strip()
+    inspected = json.loads(workflow.run(
+        [engine, "inspect", "--format", "{{json .Mounts}}", container], capture_all=True,
+    ))
+    for mount in inspected:
+        destination = mount.get("Destination", "")
+        if destination not in ("/opt/app/server.p12", "/opt/app/truststore.p12", "/opt/reachability"):
+            raise workflow.WorkflowError(f"Unexpected deployment mount for {service}: {destination}")
+    workflow.run([engine, "exec", container, "test", "-s",
+                  "/etc/schema-registry/schema-registry.properties"])
+    return {"configuration": "SCHEMA_REGISTRY_* environment variables",
+            "propertiesFileMounted": False, "mounts": inspected}
+
+
 def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: str,
                native: list[dict], instrumented: list[dict]) -> dict:
     smoke_dir = run_dir / "deployment-smoke"
@@ -168,7 +209,7 @@ def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: 
     smoke_dir.mkdir(exist_ok=True)
     metadata_dir.mkdir(exist_ok=True)
     metadata_dir.chmod(0o777)
-    original = json_file(run_dir / "compose.yaml")
+    original = workflow.read_json_object(run_dir / "compose.yaml")
     services = original.get("services", {})
     if not {"broker", "agent", "native"} <= services.keys():
         raise workflow.WorkflowError(f"Runner Compose file has unexpected services: {services.keys()}")
@@ -179,24 +220,27 @@ def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: 
     native_service.pop("build", None)
     agent["image"] = instrumented[0]["id"]
     native_service["image"] = native[0]["id"]
+    agent["environment"] = deployment_environment("schema-registry-agent")
+    native_service["environment"] = deployment_environment("schema-registry-native")
     agent["volumes"] = [
-        f"{run_dir / 'agent' / 'schema-registry.properties'}:/etc/schema-registry.properties:ro",
         f"{run_dir / 'tls' / 'server.p12'}:/opt/app/server.p12:ro",
         f"{run_dir / 'tls' / 'truststore.p12'}:/opt/app/truststore.p12:ro",
         f"{metadata_dir}:/opt/reachability",
     ]
     native_service["volumes"] = [
-        f"{run_dir / 'native' / 'schema-registry.properties'}:/etc/schema-registry.properties:ro",
         f"{run_dir / 'tls' / 'server.p12'}:/opt/app/server.p12:ro",
         f"{run_dir / 'tls' / 'truststore.p12'}:/opt/app/truststore.p12:ro",
     ]
-    broker["volumes"] = [f"{run_dir / 'kafka-data'}:/var/lib/kafka/data"]
+    kafka_data = smoke_dir / "kafka-data"
+    kafka_data.mkdir(exist_ok=True)
+    kafka_data.chmod(0o777)
+    broker["volumes"] = [f"{kafka_data}:/var/lib/kafka/data"]
     document = {"services": {"broker": broker, "agent": agent, "native": native_service}}
     compose = smoke_dir / "compose.yaml"
     compose.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     project = "srdeploy" + uuid.uuid4().hex[:12]
     prefix = [*workflow.compose_command(args.engine), "-p", project, "-f", str(compose)]
-    provenance = json_file(run_dir / "provenance.json")
+    provenance = workflow.read_json_object(run_dir / "provenance.json")
     commit = provenance["schemaCommit"]
     tls_certificate = run_dir / "tls" / "server.pem"
     checks = {}
@@ -207,16 +251,15 @@ def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: 
         agent_base = f"http://127.0.0.1:{agent['ports'][0].split(':')[1]}"
         agent_tls = int(agent["ports"][1].split(":")[1])
         workflow.wait_http(agent_base, 240)
+        checks["instrumentedStartup"] = check_environment_startup(args.engine, prefix, "agent")
         workflow.check_container_image(args.engine, prefix, instrumented[0]["id"], "agent")
         workflow.check_runtime_version(agent_base, "packaged instrumented JVM", version, commit)
         checks["instrumentedTls"] = workflow.check_tls(agent_tls, "packaged instrumented JVM", version,
                                                         commit, tls_certificate)
-        subjects = workflow.http_json("GET", f"https://localhost:{agent_tls}", "/subjects",
-                                      ssl_context=workflow.verified_tls_context(tls_certificate))
-        if not isinstance(subjects, list) or not any(
-                isinstance(subject, str) and subject.startswith("native-workflow-") for subject in subjects):
-            raise workflow.WorkflowError(f"Packaged JVM did not expose the runner's stored workload: {subjects}")
-        checks["recordedSubjects"] = subjects
+        subjects = workflow.register_jvm_schemas(
+            f"https://localhost:{agent_tls}", workflow.verified_tls_context(tls_certificate),
+        )
+        checks["recordedSubjects"] = deepcopy(subjects)
         workflow.run([*prefix, "stop", "-t", "45", "agent"])
         workflow.run([*prefix, "logs", "--no-color", "agent"], log=smoke_dir / "agent.log")
         metadata_files = sorted(metadata_dir.glob("*.json"))
@@ -241,18 +284,25 @@ def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: 
         native_base = f"http://127.0.0.1:{native_service['ports'][0].split(':')[1]}"
         native_tls = int(native_service["ports"][1].split(":")[1])
         workflow.wait_http(native_base, 240)
+        checks["nativeStartup"] = check_environment_startup(args.engine, prefix, "native")
         workflow.check_container_image(args.engine, prefix, native[0]["id"])
         workflow.check_runtime_version(native_base, "packaged native image", version, commit)
         checks["nativeTls"] = workflow.check_tls(native_tls, "packaged native image", version,
                                                   commit, tls_certificate)
-        native_subjects = workflow.http_json("GET", f"https://localhost:{native_tls}", "/subjects",
-                                             ssl_context=workflow.verified_tls_context(tls_certificate))
-        if native_subjects != subjects:
-            raise workflow.WorkflowError(
-                f"Packaged native image does not read the workload exposed by the packaged JVM: "
-                f"{native_subjects} != {subjects}"
-            )
-        checks["nativeSubjects"] = native_subjects
+        native_https = f"https://localhost:{native_tls}"
+        native_context = workflow.verified_tls_context(tls_certificate)
+        workflow.check_versions(native_https, "packaged native image", subjects, native_context)
+        workflow.register_native_schemas(native_https, subjects, native_context)
+        workflow.check_versions(native_https, "packaged native writes", subjects, native_context)
+        workflow.run([*prefix, "restart", "-t", "45", "native"])
+        workflow.wait_http(native_base, 240)
+        checks["restartedNativeStartup"] = check_environment_startup(args.engine, prefix, "native")
+        workflow.check_runtime_version(native_base, "restarted packaged native image", version, commit)
+        checks["restartedNativeTls"] = workflow.check_tls(
+            native_tls, "restarted packaged native image", version, commit, tls_certificate,
+        )
+        workflow.check_versions(native_https, "restarted packaged native image", subjects, native_context)
+        checks["nativeSubjects"] = subjects
         workflow.run([*prefix, "logs", "--no-color", "native"], log=smoke_dir / "native.log")
         workflow.run([*prefix, "logs", "--no-color", "broker"], log=smoke_dir / "broker.log")
     except Exception as error:
@@ -298,20 +348,30 @@ def main() -> int:
         run_result = run_version(args, version, platform)
         run_dir = run_result["runDirectory"]
         artifacts = run_result["artifacts"]
+        configuration_image, configuration_record = workflow.pin_image(
+            args.engine, f"docker.io/confluentinc/cp-schema-registry:{version}", platform,
+        )
         native = build_image(args, dockerfile="Dockerfile.native", image_name=args.image_name,
-                             version=version, platform=platform, run_dir=run_dir, artifacts=artifacts)
+                             version=version, platform=platform, run_dir=run_dir, artifacts=artifacts,
+                             configuration_image=configuration_image)
         instrumented = build_image(
             args, dockerfile="Dockerfile.instrumented", image_name=args.instrumented_image_name,
             version=version, platform=platform, run_dir=run_dir, artifacts=artifacts,
+            configuration_image=configuration_image,
         )
         smoke_test(args, run_dir, version, platform, native, instrumented)
+        if args.metadata_mode == "refresh":
+            workflow.save_metadata(run_dir, (args.metadata_root / version).resolve())
         builds.append({
             "version": version,
             "schemaRef": artifacts["provenance"]["schemaRef"],
             "schemaCommit": artifacts["provenance"]["schemaCommit"],
             "nativeBinarySha256": artifacts["provenance"]["nativeBinarySha256"],
             "jarSha256": artifacts["provenance"]["jarSha256"],
+            "metadataMode": artifacts["provenance"]["metadataMode"],
+            "metadata": artifacts["provenance"]["mergedMetadata"],
             "platform": platform,
+            "configurationImage": configuration_record,
             "runDirectory": str(run_dir),
             "images": {"native": native, "instrumented": instrumented},
         })

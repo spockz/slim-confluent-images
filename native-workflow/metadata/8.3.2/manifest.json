@@ -1,0 +1,14 @@
+{
+  "formatVersion": 1,
+  "releaseVersion": "8.3.2",
+  "schemaCommit": "353b1877d9049e307c6d5c0425d085d6e7fd85fa",
+  "graalvm": "container-registry.oracle.com/graalvm/native-image:25.0.4-ol9",
+  "collectedPlatform": "linux/arm64",
+  "jarSha256": "1c58b19faefcb0734c134fe9365ac6eb17b095ce1233d6498fe1bf88ac5f96ba",
+  "files": [
+    {
+      "path": "configuration/reachability-metadata.json",
+      "sha256": "d2bfe16097c87f37a10a3f2bb93c0dc6e2316fcacf8d4bbb6a3103976966ad5e"
+    }
+  ]
+}
