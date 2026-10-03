@@ -36,8 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-mode", choices=("build", "refresh"), default="build")
     parser.add_argument("--metadata-root", type=Path, default=Path(__file__).parent / "metadata",
                         help="Saved metadata root with one directory per release")
-    parser.add_argument("--image-name", default="schema-registry-native")
-    parser.add_argument("--instrumented-image-name", default="kafka-schema-registry-graalvm-instrumented")
+    parser.add_argument("--image-name", default="ghcr.io/spockz/v2/schema-registry-native")
+    parser.add_argument("--instrumented-image-name", default="ghcr.io/spockz/v2/schema-registry-instrumented")
     return parser.parse_args()
 
 

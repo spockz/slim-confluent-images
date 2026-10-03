@@ -1,4 +1,4 @@
-# Reuse reviewed metadata for releases; manual refresh runs collect candidates without publishing images.
+# Publish revised builds under v2 to isolate existing consumers; refresh runs collect candidates without publishing.
 name: Build and Publish Native Schema Registry
 
 on:
@@ -16,8 +16,8 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/schema-registry-native
-  INSTRUMENTED_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/kafka-schema-registry-graalvm-instrumented
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/v2/schema-registry-native
+  INSTRUMENTED_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/v2/schema-registry-instrumented
 
 jobs:
   build:

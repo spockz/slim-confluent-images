@@ -116,8 +116,8 @@ The default local tags are:
 
 | Image | Version tags | Architecture tags |
 | --- | --- | --- |
-| `schema-registry-native` | `8.2.0`, `8.3.2` | `8.2.0-arm64`, `8.3.2-arm64` on ARM64; `-amd64` on AMD64 |
-| `kafka-schema-registry-graalvm-instrumented` | `8.2.0`, `8.3.2` | The same architecture suffixes |
+| `ghcr.io/spockz/v2/schema-registry-native` | `8.2.0`, `8.3.2` | `8.2.0-arm64`, `8.3.2-arm64` on ARM64; `-amd64` on AMD64 |
+| `ghcr.io/spockz/v2/schema-registry-instrumented` | `8.2.0`, `8.3.2` | The same architecture suffixes |
 
 Use `--version 8.3.2` to build one release. `--schema-repo`, `--platform`, `--engine`, and `--maven` select the source checkout and build tools. `--image-name` and `--instrumented-image-name` select image repositories. Native compilation requires a container engine running the requested architecture. The default command builds the current architecture; GitHub Actions builds both AMD64 and ARM64 on their matching runners.
 
@@ -130,7 +130,7 @@ docker run --rm -p 8081:8081 \
   -e SCHEMA_REGISTRY_HOST_NAME=schema-registry \
   -e SCHEMA_REGISTRY_LISTENERS=http://0.0.0.0:8081 \
   -e SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=PLAINTEXT://broker:29092 \
-  schema-registry-native:8.3.2
+  ghcr.io/spockz/v2/schema-registry-native:8.3.2
 ```
 
 The broker address must be reachable from the container. Both deployment images retain Confluent's `ub` renderer and configuration templates, copied from the matching release image pinned by digest. The shared entrypoint writes `/etc/schema-registry/schema-registry.properties` and launches the selected runtime. Schema Registry itself waits for Kafka; the legacy Java readiness stub is not used. `images.json` records the configuration image's identity alongside the artifact hashes.
@@ -139,4 +139,4 @@ For HTTPS, mount your keystore and configure it through `SCHEMA_REGISTRY_SSL_KEY
 
 The instrumented image uses the same environment-based startup and writes agent metadata to `/opt/reachability`. Mount a directory writable by UID 10001 there to keep metadata. Stop the container gracefully so the agent flushes it.
 
-`.github/workflows/release-images.yaml` reuses committed snapshots by default, builds and verifies both versions on AMD64 and ARM64, publishes native and instrumented architecture images, then creates version manifests. Its manual `metadata_mode=refresh` option produces candidate snapshots as downloadable artifacts and skips all image publishing. Each architecture produces a separate artifact; changes must be reviewed and committed before regular release builds use them. Only 8.3.2 receives `latest`. The workflow requires the updated `8.2.0-native` and renamed `native-8.3.2` branches to be pushed to the Schema Registry fork first.
+`.github/workflows/release-images.yaml` reuses committed snapshots by default, builds and verifies both versions on AMD64 and ARM64, publishes native and instrumented architecture images, then creates version manifests. All publishing uses `ghcr.io/OWNER/v2/schema-registry-native` and `ghcr.io/OWNER/v2/schema-registry-instrumented`, where `OWNER` is the repository owner. The existing image repositories and their tags remain untouched so migration is explicit. Its manual `metadata_mode=refresh` option produces candidate snapshots as downloadable artifacts and skips all image publishing. Each architecture produces a separate artifact; changes must be reviewed and committed before regular release builds use them. Only 8.3.2 receives `latest`. The workflow requires the updated `8.2.0-native` and renamed `native-8.3.2` branches to be pushed to the Schema Registry fork first.
