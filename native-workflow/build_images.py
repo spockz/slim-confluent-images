@@ -260,6 +260,9 @@ def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: 
             f"https://localhost:{agent_tls}", workflow.verified_tls_context(tls_certificate),
         )
         checks["recordedSubjects"] = deepcopy(subjects)
+        checks["instrumentedUpstream"] = workflow.run_upstream_tests(
+            args.engine, prefix, "agent", provenance["upstreamTests"], run_dir, "packaged-jvm",
+        )
         workflow.run([*prefix, "stop", "-t", "45", "agent"])
         workflow.run([*prefix, "logs", "--no-color", "agent"], log=smoke_dir / "agent.log")
         metadata_files = sorted(metadata_dir.glob("*.json"))
@@ -294,6 +297,11 @@ def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: 
         workflow.check_versions(native_https, "packaged native image", subjects, native_context)
         workflow.register_native_schemas(native_https, subjects, native_context)
         workflow.check_versions(native_https, "packaged native writes", subjects, native_context)
+        checks["nativeUpstream"] = workflow.run_upstream_tests(
+            args.engine, prefix, "native", provenance["upstreamTests"], run_dir, "packaged-native",
+        )
+        if checks["instrumentedUpstream"]["cases"] != checks["nativeUpstream"]["cases"]:
+            raise workflow.WorkflowError("Packaged JVM and native upstream test selections differ")
         workflow.run([*prefix, "restart", "-t", "45", "native"])
         workflow.wait_http(native_base, 240)
         checks["restartedNativeStartup"] = check_environment_startup(args.engine, prefix, "native")
@@ -359,7 +367,11 @@ def main() -> int:
             version=version, platform=platform, run_dir=run_dir, artifacts=artifacts,
             configuration_image=configuration_image,
         )
-        smoke_test(args, run_dir, version, platform, native, instrumented)
+        smoke = smoke_test(args, run_dir, version, platform, native, instrumented)
+        artifacts["provenance"]["packagedUpstreamValidation"] = {
+            "jvm": smoke["checks"]["instrumentedUpstream"], "native": smoke["checks"]["nativeUpstream"],
+        }
+        (run_dir / "provenance.json").write_text(json.dumps(artifacts["provenance"], indent=2) + "\n", encoding="utf-8")
         if args.metadata_mode == "refresh":
             workflow.save_metadata(run_dir, (args.metadata_root / version).resolve())
         builds.append({

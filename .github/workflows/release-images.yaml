@@ -98,6 +98,7 @@ jobs:
             artifacts/native-images/**/result.json
             artifacts/native-images/**/smoke.json
             artifacts/native-images/**/*.log
+            artifacts/native-images/**/upstream-tests/**/results.xml
             artifacts/native-images/**/metadata/*.json
             artifacts/native-images/**/committed-metadata/**/*.json
             artifacts/native-images/**/native/reachability/**/*

@@ -637,6 +637,12 @@
       ]
     },
     {
+      "type": "io.confluent.kafka.schemaregistry.CompatibilityLevel"
+    },
+    {
+      "type": "io.confluent.kafka.schemaregistry.CompatibilityPolicy"
+    },
+    {
       "type": "io.confluent.kafka.schemaregistry.LeaderElectorTest"
     },
     {
@@ -831,7 +837,29 @@
       "type": "io.confluent.kafka.schemaregistry.client.rest.entities.SchemaEntity$EntityType"
     },
     {
-      "type": "io.confluent.kafka.schemaregistry.client.rest.entities.SchemaReference"
+      "type": "io.confluent.kafka.schemaregistry.client.rest.entities.SchemaReference",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.lang.String",
+            "java.lang.String",
+            "java.lang.Integer"
+          ]
+        },
+        {
+          "name": "getName",
+          "parameterTypes": []
+        },
+        {
+          "name": "getSubject",
+          "parameterTypes": []
+        },
+        {
+          "name": "getVersion",
+          "parameterTypes": []
+        }
+      ]
     },
     {
       "type": "io.confluent.kafka.schemaregistry.client.rest.entities.SchemaRegistryServerVersion",
@@ -916,6 +944,69 @@
       ]
     },
     {
+      "type": "io.confluent.kafka.schemaregistry.client.rest.entities.requests.ConfigUpdateRequest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalAlias",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalCompatibilityGroup",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalCompatibilityLevel",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalCompatibilityPolicy",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalDefaultMetadata",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalDefaultRuleSet",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalOverrideMetadata",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOptionalOverrideRuleSet",
+          "parameterTypes": []
+        },
+        {
+          "name": "isOptionalNormalize",
+          "parameterTypes": []
+        },
+        {
+          "name": "isOptionalValidateFields",
+          "parameterTypes": []
+        },
+        {
+          "name": "isOptionalValidateNewSchemas",
+          "parameterTypes": []
+        },
+        {
+          "name": "isOptionalValidateRules",
+          "parameterTypes": []
+        },
+        {
+          "name": "setCompatibilityLevel",
+          "parameterTypes": [
+            "java.util.Optional"
+          ]
+        }
+      ]
+    },
+    {
       "type": "io.confluent.kafka.schemaregistry.client.rest.entities.requests.RegisterSchemaRequest",
       "methods": [
         {
@@ -961,6 +1052,12 @@
         {
           "name": "isPropagateSchemaTags",
           "parameterTypes": []
+        },
+        {
+          "name": "setReferences",
+          "parameterTypes": [
+            "java.util.List"
+          ]
         },
         {
           "name": "setSchema",
@@ -1806,6 +1903,21 @@
           "parameterTypes": [
             "boolean"
           ]
+        },
+        {
+          "name": "updateSubjectLevelConfig",
+          "parameterTypes": [
+            "java.lang.String",
+            "jakarta.ws.rs.core.HttpHeaders",
+            "io.confluent.kafka.schemaregistry.client.rest.entities.requests.ConfigUpdateRequest"
+          ]
+        },
+        {
+          "name": "updateTopLevelConfig",
+          "parameterTypes": [
+            "jakarta.ws.rs.core.HttpHeaders",
+            "io.confluent.kafka.schemaregistry.client.rest.entities.requests.ConfigUpdateRequest"
+          ]
         }
       ]
     },
@@ -1854,6 +1966,25 @@
       "type": "io.confluent.kafka.schemaregistry.rest.resources.SubjectVersionsResource",
       "methods": [
         {
+          "name": "deleteSchemaVersion",
+          "parameterTypes": [
+            "jakarta.ws.rs.container.AsyncResponse",
+            "jakarta.ws.rs.core.HttpHeaders",
+            "java.lang.String",
+            "java.lang.String",
+            "boolean"
+          ]
+        },
+        {
+          "name": "getReferencedBy",
+          "parameterTypes": [
+            "java.lang.String",
+            "java.lang.String",
+            "int",
+            "int"
+          ]
+        },
+        {
           "name": "getSchemaByVersion",
           "parameterTypes": [
             "java.lang.String",
@@ -1892,6 +2023,15 @@
       "type": "io.confluent.kafka.schemaregistry.rest.resources.SubjectsResource",
       "methods": [
         {
+          "name": "deleteSubject",
+          "parameterTypes": [
+            "jakarta.ws.rs.container.AsyncResponse",
+            "jakarta.ws.rs.core.HttpHeaders",
+            "java.lang.String",
+            "boolean"
+          ]
+        },
+        {
           "name": "list",
           "parameterTypes": [
             "java.lang.String",
@@ -1922,6 +2062,104 @@
           "parameterTypes": [
             "java.lang.String"
           ]
+        }
+      ]
+    },
+    {
+      "type": "io.confluent.kafka.schemaregistry.storage.ConfigValue",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.lang.String",
+            "java.lang.String",
+            "java.lang.Boolean",
+            "java.lang.Boolean",
+            "java.lang.Boolean",
+            "java.lang.Boolean",
+            "io.confluent.kafka.schemaregistry.CompatibilityLevel",
+            "io.confluent.kafka.schemaregistry.CompatibilityPolicy",
+            "java.lang.String",
+            "io.confluent.kafka.schemaregistry.storage.Metadata",
+            "io.confluent.kafka.schemaregistry.storage.Metadata",
+            "io.confluent.kafka.schemaregistry.storage.RuleSet",
+            "io.confluent.kafka.schemaregistry.storage.RuleSet"
+          ]
+        },
+        {
+          "name": "getAlias",
+          "parameterTypes": []
+        },
+        {
+          "name": "getCompatibilityGroup",
+          "parameterTypes": []
+        },
+        {
+          "name": "getCompatibilityLevel",
+          "parameterTypes": []
+        },
+        {
+          "name": "getCompatibilityPolicy",
+          "parameterTypes": []
+        },
+        {
+          "name": "getDefaultMetadata",
+          "parameterTypes": []
+        },
+        {
+          "name": "getDefaultRuleSet",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOverrideMetadata",
+          "parameterTypes": []
+        },
+        {
+          "name": "getOverrideRuleSet",
+          "parameterTypes": []
+        },
+        {
+          "name": "isNormalize",
+          "parameterTypes": []
+        },
+        {
+          "name": "isValidateFields",
+          "parameterTypes": []
+        },
+        {
+          "name": "isValidateNewSchemas",
+          "parameterTypes": []
+        },
+        {
+          "name": "isValidateRules",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "io.confluent.kafka.schemaregistry.storage.DeleteSubjectKey",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "io.confluent.kafka.schemaregistry.storage.DeleteSubjectValue",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.lang.String",
+            "java.lang.Integer"
+          ]
+        },
+        {
+          "name": "getVersion",
+          "parameterTypes": []
         }
       ]
     },
@@ -2021,7 +2259,29 @@
       ]
     },
     {
-      "type": "io.confluent.kafka.schemaregistry.storage.SchemaReference"
+      "type": "io.confluent.kafka.schemaregistry.storage.SchemaReference",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.lang.String",
+            "java.lang.String",
+            "java.lang.Integer"
+          ]
+        },
+        {
+          "name": "getName",
+          "parameterTypes": []
+        },
+        {
+          "name": "getSubject",
+          "parameterTypes": []
+        },
+        {
+          "name": "getVersion",
+          "parameterTypes": []
+        }
+      ]
     },
     {
       "type": "io.confluent.kafka.schemaregistry.storage.SchemaRegistry"
@@ -3923,6 +4183,9 @@
     },
     {
       "type": "org.apache.avro.reflect.Nullable"
+    },
+    {
+      "type": "org.apache.avro.util.springframework.ConcurrentReferenceHashMap$Segment[]"
     },
     {
       "type": "org.apache.kafka.clients.DefaultHostResolver",
@@ -9749,6 +10012,9 @@
     },
     {
       "glob": "META-INF/services/javax.management.remote.JMXConnectorServerProvider"
+    },
+    {
+      "glob": "META-INF/services/org.apache.avro.Conversion"
     },
     {
       "glob": "META-INF/services/org.apache.avro.LogicalTypes$LogicalTypeFactory"

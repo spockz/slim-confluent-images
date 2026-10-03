@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import deque
 import hashlib
 import http.client
@@ -103,8 +104,10 @@ def pin_image(engine: str, image: str, platform: str) -> tuple[str, dict]:
     run([engine, "pull", "--platform", platform, image])
     record = inspect_image(engine, image)
     digests = record.get("repoDigests") or []
-    target_name = image.rsplit("/", 1)[-1].split(":", 1)[0]
-    matching = [entry for entry in digests if entry.split("@", 1)[0].rsplit("/", 1)[-1] == target_name]
+    target_name = image.split("@", 1)[0].rsplit("/", 1)[-1].split(":", 1)[0]
+    requested_digest = image.partition("@")[2]
+    matching = [entry for entry in digests if entry.split("@", 1)[0].rsplit("/", 1)[-1] == target_name
+                and (not requested_digest or entry.partition("@")[2] == requested_digest)]
     if not matching:
         raise WorkflowError(f"Image engine returned no registry digest for {image}: {record}")
     pinned = sorted(matching)[0]
@@ -237,6 +240,114 @@ def read_json_object(path: Path) -> dict:
     return document
 
 
+def adapt_upstream_assertion(source: str, expected_code: int) -> str:
+    tree = ast.parse(source)
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name == "test_api_register_schema_incompatible"]
+    expected_left = ast.dump(ast.parse("e.value.error_code", mode="eval").body)
+    assertions = [node for function in functions for node in ast.walk(function) if isinstance(node, ast.Assert)
+                  and isinstance(node.test, ast.Compare) and ast.dump(node.test.left) == expected_left
+                  and len(node.test.ops) == 1 and isinstance(node.test.ops[0], ast.Eq)
+                  and len(node.test.comparators) == 1 and isinstance(node.test.comparators[0], ast.Constant)
+                  and node.test.comparators[0].value == 409]
+    if len(assertions) != 1:
+        raise WorkflowError("Pinned upstream incompatibility assertion no longer matches its adaptation")
+    literal = assertions[0].test.comparators[0]
+    lines = source.splitlines(keepends=True)
+    line = lines[literal.lineno - 1]
+    lines[literal.lineno - 1] = line[:literal.col_offset] + str(expected_code) + line[literal.end_col_offset:]
+    adapted = "".join(lines)
+    literal.value = expected_code
+    if ast.dump(ast.parse(adapted)) != ast.dump(tree):
+        raise WorkflowError("Upstream assertion adaptation changed additional test semantics")
+    return adapted
+
+
+def prepare_upstream_tests(engine: str, platform: str, run_dir: Path) -> dict:
+    definition = Path(__file__).parent / "upstream-tests"
+    suite = read_json_object(definition / "suite.json")
+    context = run_dir / "upstream-tests" / "context"
+    context.mkdir(parents=True)
+    archive = context / "upstream.tar.gz"
+    url = f"https://codeload.github.com/confluentinc/confluent-kafka-python/tar.gz/{suite['commit']}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output)
+    except (OSError, urllib.error.URLError) as error:
+        raise WorkflowError(f"Could not download pinned upstream tests: {error}") from error
+    if sha256(archive) != suite["archiveSha256"]:
+        raise WorkflowError("Pinned upstream test archive failed its SHA-256 check")
+    for filename in ("Dockerfile", "requirements.lock", "conftest.py", "test_contract.py"):
+        shutil.copy2(definition / filename, context / filename)
+    with tarfile.open(archive) as source:
+        path = (f"confluent-kafka-python-{suite['commit']}/tests/integration/schema_registry"
+                "/_sync/test_api_client.py")
+        stream = source.extractfile(path)
+        if stream is None:
+            raise WorkflowError("Pinned upstream API module is missing")
+        with stream:
+            api_source = stream.read().decode("utf-8")
+    (context / "test_api_client.py").write_text(
+        adapt_upstream_assertion(api_source, suite["incompatibleSchemaErrorCode"]), encoding="utf-8",
+    )
+    reference, base = pin_image(engine, suite["pythonImage"], platform)
+    recipe = {filename: sha256(context / filename) for filename in
+              ("Dockerfile", "requirements.lock", "conftest.py", "test_contract.py", "test_api_client.py")}
+    identity = hashlib.sha256(json.dumps({"suite": suite, "recipe": recipe}, sort_keys=True).encode()).hexdigest()
+    image = "schema-registry-upstream-tests:" + identity[:16]
+    run([engine, "build", "--platform", platform, "--build-arg", f"PYTHON_IMAGE={reference}",
+         "-t", image, str(context)], log=run_dir / "upstream-tests" / "build.log")
+    return {"definition": suite, "recipe": recipe, "baseImage": base,
+            "image": inspect_image(engine, image)}
+
+
+def validate_upstream_report(path: Path, expected: int) -> list[str]:
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise WorkflowError(f"Missing or invalid upstream JUnit report: {path}: {error}") from error
+    cases = root.findall(".//testcase")
+    names = [f"{case.get('classname')}::{case.get('name')}" for case in cases]
+    if len(cases) != expected or len(set(names)) != expected:
+        raise WorkflowError(f"Upstream suite executed {len(cases)} tests; expected exactly {expected}: {path}")
+    if any(child.tag in {"failure", "error", "skipped"} for case in cases for child in case):
+        raise WorkflowError(f"Upstream suite reported failures, errors, or skipped tests: {path}")
+    return sorted(names)
+
+
+def run_upstream_tests(engine: str, prefix: list[str], service: str, suite: dict,
+                       run_dir: Path, label: str, certificate: Path | None = None) -> dict:
+    target = run([*prefix, "ps", "-q", service]).strip()
+    if not target:
+        raise WorkflowError(f"No running {service} container for upstream tests")
+    output = run_dir / "upstream-tests" / label
+    output.mkdir(parents=True)
+    definition = suite["definition"]
+    modules = ["tests/integration/schema_registry/_sync/" + module for module in
+               [*definition["modules"], "test_contract.py"]]
+    container = run([
+        engine, "create", "--name", "srupstream-" + uuid.uuid4().hex[:12],
+        "--network", f"container:{target}", "-e", "BROKERS=broker:29092",
+        "-e", "SR_URL=https://localhost:8082", "-e", "SR_CA=/server.pem",
+        suite["image"]["id"], "-q", "--timeout=90", "--timeout-method=thread",
+        "--junitxml=/reports/results.xml", "-k", f"not {definition['excluded']}", *modules,
+    ]).strip()
+    try:
+        run([engine, "cp", str(certificate or run_dir / "tls" / "server.pem"), f"{container}:/server.pem"])
+        run([engine, "start", "--attach", container], log=output / "pytest.log")
+        state = json.loads(run([engine, "inspect", "--format", "{{json .State}}", container], capture_all=True))
+        run([engine, "cp", f"{container}:/reports/results.xml", str(output / "results.xml")])
+        if state.get("Status") != "exited" or state.get("ExitCode") != 0:
+            raise WorkflowError(f"Upstream tests failed for {label}: {state}")
+        cases = validate_upstream_report(output / "results.xml", definition["expectedTests"])
+    finally:
+        run([engine, "rm", "--force", container])
+    report = {"status": "passed", "cases": cases, "tests": len(cases),
+              "junitPath": str((output / "results.xml").relative_to(run_dir))}
+    (output / "result.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
 def collect_saved_metadata(directory: Path, run_dir: Path, version: str, commit: str,
                            *, refresh: bool) -> tuple[list[dict], dict | None]:
     if not directory.exists() and refresh:
@@ -307,6 +418,17 @@ def save_metadata(run_dir: Path, directory: Path) -> None:
             "collectedPlatform": provenance["platform"], "jarSha256": provenance["jarSha256"],
             "files": records,
         }
+        if "upstreamTests" in provenance:
+            validation = provenance.get("upstreamValidation", {})
+            if any(validation.get(runtime, {}).get("status") != "passed" for runtime in ("jvm", "native")):
+                raise WorkflowError("Cannot save metadata before both upstream integration runs pass")
+            manifest["upstreamTests"] = provenance["upstreamTests"]
+            manifest["upstreamValidation"] = validation
+            if "packagedUpstreamValidation" in provenance:
+                packaged = provenance["packagedUpstreamValidation"]
+                if any(packaged.get(runtime, {}).get("status") != "passed" for runtime in ("jvm", "native")):
+                    raise WorkflowError("Cannot save metadata before both packaged integration runs pass")
+                manifest["packagedUpstreamValidation"] = packaged
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         backup = Path(temporary) / "previous"
         if directory.exists():
@@ -896,6 +1018,7 @@ def main() -> int:
     saved_metadata, saved_manifest = collect_saved_metadata(
         metadata_directory, run_dir, args.release_version, commit, refresh=refresh,
     )
+    upstream_suite = prepare_upstream_tests(args.engine, args.platform, run_dir)
     normalize_source_versions(source, args.release_version)
     legacy_service_merge = merge_legacy_services(source, args.release_version)
     pom = source / "package-schema-registry" / "pom.xml"
@@ -960,6 +1083,8 @@ def main() -> int:
     graal_ref, graal_inspection = pin_image(args.engine, GRAAL_IMAGE, args.platform)
     kafka_ref, kafka_inspection = pin_image(args.engine, KAFKA_IMAGE, args.platform)
     runtime_ref, runtime_inspection = pin_image(args.engine, RUNTIME_IMAGE, args.platform)
+    provenance["upstreamTests"] = upstream_suite
+    provenance["upstreamValidation"] = {}
     provenance["images"] = {
         "graalvm": {**graal_inspection, "reference": graal_ref},
         "kafka": {**kafka_inspection, "reference": kafka_ref},
@@ -1002,6 +1127,10 @@ def main() -> int:
         ))
         (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         subjects = register_jvm_schemas(tls_base, tls_context)
+        provenance["upstreamValidation"]["jvm"] = run_upstream_tests(
+            args.engine, prefix, "agent", upstream_suite, run_dir, "jvm",
+        )
+        (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         run([*prefix, "stop", "-t", "45", "agent"])
         run([*prefix, "logs", "--no-color", "agent"], log=run_dir / "agent.log")
         metadata_files = sorted((run_dir / "metadata").glob("*.json")) if refresh else []
@@ -1040,6 +1169,12 @@ def main() -> int:
         native_tls_context = verified_tls_context(tls_certificate)
         check_versions(native_tls_base, "native replay of JVM registrations", subjects, native_tls_context)
         register_native_schemas(native_tls_base, subjects, native_tls_context)
+        provenance["upstreamValidation"]["native"] = run_upstream_tests(
+            args.engine, prefix, "native", upstream_suite, run_dir, "native",
+        )
+        if provenance["upstreamValidation"]["jvm"]["cases"] != provenance["upstreamValidation"]["native"]["cases"]:
+            raise WorkflowError("JVM and native upstream test selections differ")
+        (run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         run([*prefix, "stop", "-t", "45", "native"])
         run([*prefix, "up", "-d", "native"])
         wait_http(native_base, args.ready_timeout)

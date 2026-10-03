@@ -91,6 +91,13 @@ class AdditiveMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(workflow.WorkflowError, "metadata changed"):
             workflow.merge_reachability_metadata(self.engine, self.graal_image, self.run_dir, committed)
 
+    def test_pinned_image_preserves_the_requested_digest(self):
+        reference, record = workflow.pin_image(
+            self.engine, self.graal_image, workflow.engine_architecture(self.engine),
+        )
+        self.assertEqual(self.graal_image, reference)
+        self.assertEqual(self.graal_image, record["pinnedReference"])
+
     def test_invalid_agent_metadata_is_rejected(self):
         self.write_metadata({"reflection": [{"type": "fixture.Before"}]}, {})
         self.agent.write_text("{not valid JSON}")
@@ -184,6 +191,30 @@ class AdditiveMetadataTests(unittest.TestCase):
         content = (self.run_dir / "agent/Dockerfile").read_text()
         entrypoint = json.loads(content.split("ENTRYPOINT ")[1])
         self.assertTrue(any("native-image-agent" in option for option in entrypoint))
+
+    def test_integration_failure_preserves_reviewed_snapshot(self):
+        snapshot = self.root / "snapshot"
+        self.save_verified_fixture(snapshot)
+        original = {path.relative_to(snapshot): path.read_bytes() for path in snapshot.rglob("*") if path.is_file()}
+        provenance = workflow.read_json_object(self.run_dir / "provenance.json")
+        provenance["upstreamTests"] = {"definition": {"expectedTests": 53}}
+        provenance["upstreamValidation"] = {"jvm": {"status": "passed"}, "native": {"status": "failed"}}
+        (self.run_dir / "provenance.json").write_text(json.dumps(provenance))
+        with self.assertRaisesRegex(workflow.WorkflowError, "both upstream integration runs"):
+            workflow.save_metadata(self.run_dir, snapshot)
+        provenance["upstreamValidation"]["native"]["status"] = "passed"
+        provenance["packagedUpstreamValidation"] = {"jvm": {"status": "passed"}, "native": {"status": "failed"}}
+        (self.run_dir / "provenance.json").write_text(json.dumps(provenance))
+        with self.assertRaisesRegex(workflow.WorkflowError, "both packaged integration runs"):
+            workflow.save_metadata(self.run_dir, snapshot)
+        self.assertEqual(original, {path.relative_to(snapshot): path.read_bytes()
+                                    for path in snapshot.rglob("*") if path.is_file()})
+        provenance["packagedUpstreamValidation"]["native"]["status"] = "passed"
+        (self.run_dir / "provenance.json").write_text(json.dumps(provenance))
+        workflow.save_metadata(self.run_dir, snapshot)
+        saved = workflow.read_json_object(snapshot / "manifest.json")
+        self.assertEqual(provenance["upstreamValidation"], saved["upstreamValidation"])
+        self.assertEqual(provenance["packagedUpstreamValidation"], saved["packagedUpstreamValidation"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/confluentinc/confluent-kafka-python",
+  "release": "v2.12.2",
+  "commit": "2acaa79509569d7031aa3c16e24500611c5f18a3",
+  "archiveSha256": "f656eec6a7a261db351097a177a93fe77f7acf8958da23e451ab0a4c11056466",
+  "pythonImage": "docker.io/library/python@sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3",
+  "modules": [
+    "test_api_client.py",
+    "test_avro_serializers.py",
+    "test_json_serializers.py",
+    "test_proto_serializers.py"
+  ],
+  "expectedTests": 53,
+  "excluded": "kafka_cluster_cp_7_0_1",
+  "exclusionReason": "One upstream parameter explicitly targets Schema Registry 7.0.1 and expects its obsolete HTTP 500 response.",
+  "incompatibleSchemaErrorCode": 40901,
+  "assertionAdaptation": "The pinned Python API test expects the historical registry code 409; both Schema Registry v8.2.0 and v8.3.2 define INCOMPATIBLE_SCHEMA_ERROR_CODE as 40901. HTTP status 409 remains unchanged."
+}
