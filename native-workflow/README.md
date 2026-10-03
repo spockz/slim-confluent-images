@@ -119,9 +119,13 @@ The default local tags are:
 | `ghcr.io/spockz/v2/schema-registry-native` | `8.2.0`, `8.3.2` | `8.2.0-arm64`, `8.3.2-arm64` on ARM64; `-amd64` on AMD64 |
 | `ghcr.io/spockz/v2/schema-registry-instrumented` | `8.2.0`, `8.3.2` | The same architecture suffixes |
 
+Build mode also assigns `VERSION-SCHEMA_SHA-PIPELINE_SHA` and its architecture suffix, using 12 hexadecimal characters from each commit. For example, `8.2.0-ae217b54fb5b-7f71540abcde` identifies both source revisions. Full commits are recorded in provenance, publication artifacts, and image labels. Tracked pipeline and metadata changes must be committed before build mode; refresh mode produces candidates without commit tags.
+
 Use `--version 8.3.2` to build one release. `--schema-repo`, `--platform`, `--engine`, and `--maven` select the source checkout and build tools. `--image-name` and `--instrumented-image-name` select image repositories. Native compilation requires a container engine running the requested architecture. The default command builds the current architecture; GitHub Actions builds both AMD64 and ARM64 on their matching runners.
 
 Build records and logs are retained under `artifacts/native-images/`. `images.json` records the source commits, input hashes, image identities, and tags after all requested builds succeed. Local builds do not push images or assign a `latest` tag.
+
+CI first publishes commit-tagged architecture images, then combines their recorded registry digests into the commit-tagged multi-architecture image. Existing commit tags are reused after checking full commit identities and platform; conflicting tags fail publication instead of being overwritten. Both architecture records must identify the same source and pipeline commits. Workflow runs for the same pipeline commit are serialized to prevent competing first publications. Version, architecture-version, and `latest` aliases are updated from those recorded digests. Commit tags remain fixed under this publishing policy; use `@sha256:...` when registry-enforced content identity is required.
 
 Deployment images use UID 10001 and generate configuration from the existing `SCHEMA_REGISTRY_*` environment variables:
 

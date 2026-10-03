@@ -14,6 +14,7 @@ import sys
 import tempfile
 import uuid
 
+from publish_images import immutable_release_tag
 import run as workflow
 
 
@@ -124,6 +125,9 @@ def build_image(args: argparse.Namespace, *, dockerfile: str, image_name: str,
     architecture = platform.split("/", 1)[1]
     tags = [f"{image_name}:{version}-{architecture}", f"{image_name}:{version}"]
     provenance = artifacts["provenance"]
+    if provenance.get("immutableTag"):
+        tags.extend((f"{image_name}:{provenance['immutableTag']}-{architecture}",
+                     f"{image_name}:{provenance['immutableTag']}"))
     with tempfile.TemporaryDirectory(prefix=f"schema-registry-{version}-") as temporary:
         context = Path(temporary)
         if dockerfile == "Dockerfile.native":
@@ -157,6 +161,8 @@ def build_image(args: argparse.Namespace, *, dockerfile: str, image_name: str,
             "--build-arg", f"CONFIGURATION_IMAGE={configuration_image}",
             "--build-arg", f"RELEASE_VERSION={version}",
             "--build-arg", f"SCHEMA_REVISION={provenance['schemaCommit']}",
+            "--label", f"io.spockz.pipeline.revision={provenance['pipelineCommit']}",
+            "--label", "org.opencontainers.image.source=https://github.com/spockz/slim-confluent-images",
             str(context),
         ))
         workflow.run(command)
@@ -338,6 +344,13 @@ def smoke_test(args: argparse.Namespace, run_dir: Path, version: str, platform: 
 
 def main() -> int:
     args = parse_args()
+    pipeline_repo = Path(__file__).resolve().parents[1]
+    pipeline_commit = workflow.run(["git", "-C", str(pipeline_repo), "rev-parse", "HEAD"]).strip()
+    pipeline_dirty = bool(workflow.run([
+        "git", "-C", str(pipeline_repo), "status", "--porcelain", "--untracked-files=no",
+    ]).strip())
+    if args.metadata_mode == "build" and pipeline_dirty:
+        raise workflow.WorkflowError("Commit tracked pipeline and metadata changes before building commit-tagged images")
     args.versions = list(dict.fromkeys(args.versions or VERSIONS.keys()))
     args.schema_repo = args.schema_repo.resolve()
     if not (args.schema_repo / ".git").exists():
@@ -356,6 +369,11 @@ def main() -> int:
         run_result = run_version(args, version, platform)
         run_dir = run_result["runDirectory"]
         artifacts = run_result["artifacts"]
+        artifacts["provenance"].update({
+            "pipelineCommit": pipeline_commit, "pipelineDirty": pipeline_dirty,
+            "immutableTag": immutable_release_tag(version, artifacts["provenance"]["schemaCommit"], pipeline_commit)
+                            if args.metadata_mode == "build" else None,
+        })
         configuration_image, configuration_record = workflow.pin_image(
             args.engine, f"docker.io/confluentinc/cp-schema-registry:{version}", platform,
         )
@@ -375,9 +393,13 @@ def main() -> int:
         if args.metadata_mode == "refresh":
             workflow.save_metadata(run_dir, (args.metadata_root / version).resolve())
         builds.append({
+            "status": "passed",
             "version": version,
             "schemaRef": artifacts["provenance"]["schemaRef"],
             "schemaCommit": artifacts["provenance"]["schemaCommit"],
+            "pipelineCommit": pipeline_commit,
+            "pipelineDirty": pipeline_dirty,
+            "immutableTag": artifacts["provenance"]["immutableTag"],
             "nativeBinarySha256": artifacts["provenance"]["nativeBinarySha256"],
             "jarSha256": artifacts["provenance"]["jarSha256"],
             "metadataMode": artifacts["provenance"]["metadataMode"],
